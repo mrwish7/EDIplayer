@@ -1,0 +1,3 @@
+// Windows resources. GLFW uses the icon named GLFW_ICON for its windows, and
+// Explorer shows the first icon in the exe, so this one name covers both.
+GLFW_ICON ICON "icon.ico"

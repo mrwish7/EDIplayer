@@ -1,8 +1,10 @@
 #pragma once
 
 // Audio decoders for DAB services, built on the libfaad (AAC) and libmad
-// (MPEG Layer II) ports in src/decoders. Both produce interleaved 16-bit
-// stereo PCM.
+// (MPEG Layer II) ports in src/decoders. Both produce interleaved stereo
+// float PCM, full scale = 1.0. Peaks are NOT clipped: loud broadcasts decode
+// to slightly above full scale (inter-sample overs), and clipping them here
+// is audible distortion.
 
 #include <cstddef>
 #include <cstdint>
@@ -23,7 +25,7 @@ public:
     // Decode one access unit. sfFormat is the superframe format byte, which
     // selects the decoder configuration. au == nullptr (a corrupt AU) yields
     // one frame of silence so playback timing is kept. Appends to `out`.
-    bool decode(const uint8_t *au, size_t len, uint8_t sfFormat, std::vector<int16_t> &out, int &rate);
+    bool decode(const uint8_t *au, size_t len, uint8_t sfFormat, std::vector<float> &out, int &rate);
     void reset();
 
     // e.g. "HE-AAC v2, 48 kHz, stereo (PS)"
@@ -48,7 +50,7 @@ public:
     ~Mp2FrameDecoder();
 
     // Decode one MPEG audio frame (one 24 ms logical frame at 48 kHz).
-    bool decode(const uint8_t *frame, size_t len, std::vector<int16_t> &out, int &rate);
+    bool decode(const uint8_t *frame, size_t len, std::vector<float> &out, int &rate);
     void reset();
     std::string describe() const;
 

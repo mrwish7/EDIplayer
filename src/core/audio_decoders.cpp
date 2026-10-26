@@ -37,7 +37,7 @@ bool DabPlusDecoder::configure(uint8_t sf)
     handle_ = dec_->NeAACDecOpen();
     if (!handle_) return false;
     NeAACDecConfigurationPtr cfg = dec_->NeAACDecGetCurrentConfiguration(handle_);
-    cfg->outputFormat = FAAD_FMT_16BIT;
+    cfg->outputFormat = FAAD_FMT_FLOAT;   // the 16-bit output hard-clips overs
     dec_->NeAACDecSetConfiguration(handle_, cfg);
 
     // AudioSpecificConfig, as dablin builds it - the only way to select the
@@ -67,7 +67,7 @@ bool DabPlusDecoder::configure(uint8_t sf)
     return true;
 }
 
-bool DabPlusDecoder::decode(const uint8_t *au, size_t len, uint8_t sf, std::vector<int16_t> &out, int &rate)
+bool DabPlusDecoder::decode(const uint8_t *au, size_t len, uint8_t sf, std::vector<float> &out, int &rate)
 {
     if ((int)sf != format_ && !configure(sf)) return false;
     rate = rate_;
@@ -75,7 +75,7 @@ bool DabPlusDecoder::decode(const uint8_t *au, size_t len, uint8_t sf, std::vect
     if (au) {
         NeAACDecFrameInfo info;
         memset(&info, 0, sizeof(info));
-        int16_t pcm[2048 * 2 * 2];
+        float pcm[2048 * 2 * 2];   // libfaad float output: full scale = 1.0
         void *buf = pcm;
         dec_->NeAACDecDecode2(handle_, &info, const_cast<uint8_t *>(au), (uint32_t)len, &buf, sizeof(pcm));
         if (info.error == 0 && info.samples > 0 && info.channels > 0) {
@@ -124,7 +124,7 @@ void Mp2FrameDecoder::reset()
     rate_ = channels_ = bitrate_ = 0;
 }
 
-bool Mp2FrameDecoder::decode(const uint8_t *frame, size_t len, std::vector<int16_t> &out, int &rate)
+bool Mp2FrameDecoder::decode(const uint8_t *frame, size_t len, std::vector<float> &out, int &rate)
 {
     // libmad wants MAD_BUFFER_GUARD bytes after the last frame
     in_.assign(frame, frame + len);
@@ -139,10 +139,12 @@ bool Mp2FrameDecoder::decode(const uint8_t *frame, size_t len, std::vector<int16
     rate = rate_ = (int)dec_->getSampleRate();
     channels_ = dec_->getChannels();
     bitrate_ = (int)dec_->getBitRate();
+    // MP2Decoder hands back libmad's fixed-point samples unclipped (Q3.28)
+    const float scale = 1.0f / (float)MAD_F_ONE;
     size_t o = out.size();
     out.resize(o + frames * 2);
     for (size_t i = 0; i < frames * 2; i++)
-        out[o + i] = (int16_t)(pcm_[i] >> 16);
+        out[o + i] = (float)pcm_[i] * scale;
     return true;
 }
 

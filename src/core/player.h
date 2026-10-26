@@ -8,19 +8,23 @@
 // player through select() and snapshot(); decoded audio goes to a PcmSink.
 
 #include "edi_source.h"
+#include "recorder.h"
+#include "spi.h"
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
-// Receives decoded audio: interleaved 16-bit stereo.
+// Receives decoded audio: interleaved stereo float, full scale = 1.0 (peaks
+// may exceed it slightly; see audio_decoders.h).
 class PcmSink {
 public:
     virtual ~PcmSink() = default;
-    virtual void pcm(const int16_t *data, size_t frames, int rate) = 0;
+    virtual void pcm(const float *data, size_t frames, int rate) = 0;
     virtual void flush() = 0;   // drop buffered audio (service change / stop)
 };
 
@@ -30,6 +34,8 @@ struct ServiceEntry {
     int scid = -1;
     int kbps = 0;
     bool dabplus = false;      // false: DAB (MP2)
+    int pty = -1;              // international programme type (FIG 0/17), -1 unknown
+    std::string protection;    // "EEP-3A", "UEP-3", empty if unknown
 };
 
 struct DlPlusItem {
@@ -52,11 +58,23 @@ struct PlayerSnapshot {
     std::string sourceUrl;
 
     uint16_t eid = 0;
+    int ecc = -1;                          // Extended Country Code (FIG 0/9), -1 until known
     std::string ensemble;
     std::vector<ServiceEntry> services;   // audio services, sorted by label
 
     int selectedSid = -1;
     std::string audioFormat;               // e.g. "HE-AAC v2, 48 kHz, stereo (PS)"
+
+    // Bitrate breakdown of the playing service, kbit/s averaged over ~4 s
+    struct Rates {
+        bool valid = false;
+        bool dabplus = false;
+        double subchannel = 0;   // gross sub-channel rate
+        double useful = 0;       // after Reed-Solomon (DAB+), = subchannel for MP2
+        double audio = 0;        // coded audio
+        double pad = 0;          // programme associated data
+        double overhead = 0;     // useful - audio - pad (headers, CRCs, padding)
+    } rates;
     bool audioOk = false;                  // decoding produced audio recently
 
     uint64_t dlsVersion = 0;
@@ -66,6 +84,16 @@ struct PlayerSnapshot {
 
     uint64_t slideVersion = 0;
     std::shared_ptr<const Slide> slide;
+
+    // SPI: service logos (by SId) and carousel progress
+    uint64_t logosVersion = 0;
+    std::map<uint16_t, ServiceLogos> logos;
+    SharedBytes ensembleLogo;              // 32x32 (or nearest square), if the SI has one
+    SpiProgress spi;
+    std::string spiFolder;
+
+    // recordings of the playing service: [Recorder::Raw], [Recorder::Wav]
+    Recorder::State rec[2];
 
     // statistics
     uint64_t rxBytes = 0, afFrames = 0;
@@ -85,20 +113,34 @@ public:
     // EDI frame.
     void select(int sid);
 
+    // Folder in which EDIplayer_SPI/ is created (set before start())
+    void setSpiBaseDir(const std::string &dir) { spiBaseDir_ = dir; }
+
+    // Record the playing service into <dir>/EDIplayer_audio. Recordings stop
+    // when the service changes or the player stops.
+    void setRecordBaseDir(const std::string &dir) { recorder_.setBaseDir(dir); }
+    bool startRecording(Recorder::Kind k, std::string &err);
+    void stopRecording(Recorder::Kind k) { recorder_.stop(k); }
+
     PlayerSnapshot snapshot() const;
 
     // Names for DL Plus content types ("Title", "Artist", ...)
     static const char *dlPlusTypeName(int type);
+
+    // Programme type name (European / RDS table, ETSI TS 101 756 table 12)
+    static const char *ptyName(int pty);
 
 private:
     struct Engine;
     void onAfPacket(const uint8_t *af, size_t len);
 
     PcmSink *sink_;
+    Recorder recorder_;      // before source_: the receive thread writes to it
     EdiSource source_;
     std::atomic<bool> running_{false};
     std::atomic<int> pendingSid_{-2};      // -2: no change requested
     std::string url_;
+    std::string spiBaseDir_ = ".";
 
     mutable std::mutex mutex_;             // guards snap_
     PlayerSnapshot snap_;

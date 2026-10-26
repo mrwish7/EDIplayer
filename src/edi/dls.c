@@ -106,6 +106,11 @@ static void handle_label_segment(dls_ctx_t *ctx, const uint8_t *dg, size_t field
         raw_len += ctx->seg_len[i];
     }
 
+    /* A new label (toggle changed): the previous DL Plus command belonged to
+     * the old label and must not be applied to this one */
+    if (!ctx->label_valid || ctx->label_toggle != toggle)
+        ctx->dlp_valid = false;
+
     ctx->label_valid   = true;
     ctx->label_toggle  = toggle;
     ctx->label_charset = ctx->charset;

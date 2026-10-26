@@ -31,9 +31,10 @@
  *   MP2:  one complete MPEG audio frame (the whole logical frame).
  */
 
-typedef void (*pad_cb_t)(void *opaque,
-                         const uint8_t *xpad, size_t xpad_len,
-                         bool exact_xpad_len, const uint8_t *fpad);
+/* Returns the number of X-PAD bytes actually in use (CI list + subfields) */
+typedef size_t (*pad_cb_t)(void *opaque,
+                           const uint8_t *xpad, size_t xpad_len,
+                           bool exact_xpad_len, const uint8_t *fpad);
 
 typedef enum {
     AUDIO_UNKNOWN = 0,
@@ -73,6 +74,12 @@ typedef struct {
     uint32_t    au_ok;
     uint32_t    au_crc_err;
     uint32_t    pad_frames;           /* AUs / MP2 frames carrying PAD */
+
+    /* Byte counters for the bitrate breakdown (cumulative):
+     *   DAB+: audio = AU bytes excluding the PAD DSE; pad = DSE bytes
+     *   MP2:  pad = F-PAD + X-PAD in use; audio = rest of the frame */
+    uint64_t    audio_bytes;
+    uint64_t    pad_bytes;
 } audio_ctx_t;
 
 void audio_init(audio_ctx_t *ctx, pad_cb_t cb, void *opaque);

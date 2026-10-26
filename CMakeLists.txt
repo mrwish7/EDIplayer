@@ -20,7 +20,8 @@ option(EDIPLAYER_BUILD_TOOLS "Build the edi-probe command line test tool" ON)
 
 if(MSVC)
   add_compile_options(/W3 /utf-8 /bigobj)
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS _USE_MATH_DEFINES NOMINMAX)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS _USE_MATH_DEFINES NOMINMAX
+                          _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING)
 else()
   add_compile_options(-Wall)
 endif()
@@ -58,7 +59,8 @@ endif()
 # ---- player engine: network input, decoding pipeline, audio output ----
 add_library(playercore STATIC
   src/core/log.cpp src/core/edi_source.cpp src/core/audio_decoders.cpp
-  src/core/player.cpp src/core/audio_out.cpp)
+  src/core/player.cpp src/core/audio_out.cpp src/core/spi.cpp src/core/countries.cpp
+  src/core/recorder.cpp)
 target_include_directories(playercore PUBLIC src PRIVATE third_party/miniaudio)
 target_link_libraries(playercore PUBLIC edicore decoders)
 if(WIN32)
@@ -86,6 +88,9 @@ if(EDIPLAYER_BUILD_GUI)
     ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
   target_include_directories(EDIplayer PRIVATE ${IMGUI_DIR} third_party/stb)
   target_link_libraries(EDIplayer PRIVATE playercore glfw OpenGL::GL)
+  if(WIN32)
+    target_sources(EDIplayer PRIVATE res/EDIplayer.rc)   # exe + window icon (tools/gen_icon.py)
+  endif()
   if(MSVC)
     # GUI subsystem, but with the standard main() entry point
     target_link_options(EDIplayer PRIVATE /ENTRY:mainCRTStartup)

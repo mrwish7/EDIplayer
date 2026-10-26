@@ -68,17 +68,6 @@ int32_t MP2Decoder::findSyncWord(uint8_t* buf, int32_t nBytes) {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 /* D E C O D E */
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-static inline int16_t MP2_scaleToInt16(mad_fixed_t sample) {
-    /* standard libmad reference scaling: round, then clip to full scale, then
-     * shift Q3.28 down to a 16-bit signed range */
-    sample += (1L << (MAD_F_FRACBITS - 16));
-    if (sample >= MAD_F_ONE) {
-        sample = MAD_F_ONE - 1;
-    } else if (sample < -MAD_F_ONE) {
-        sample = -MAD_F_ONE;
-    }
-    return (int16_t)(sample >> (MAD_F_FRACBITS + 1 - 16));
-}
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 int32_t MP2Decoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) {
 
@@ -111,11 +100,14 @@ int32_t MP2Decoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) 
     int              nch = pcm->channels;
     int              n = pcm->length;
 
+    // EDIplayer: hand back libmad's fixed-point samples (Q3.28, MAD_F_ONE = full scale)
+    // unclipped and at full precision; the caller converts to float. Rounding to 16 bits
+    // here clipped the overs of loud broadcasts (MP2_scaleToInt16).
     for (int i = n - 1; i >= 0; i--) {
-        int16_t l16 = MP2_scaleToInt16(pcm->samples[0][i]);
-        int16_t r16 = (nch == 2) ? MP2_scaleToInt16(pcm->samples[1][i]) : l16;
-        outbuf[i * 2]     = ((int32_t)l16) << 16;
-        outbuf[i * 2 + 1] = ((int32_t)r16) << 16;
+        mad_fixed_t l = pcm->samples[0][i];
+        mad_fixed_t r = (nch == 2) ? pcm->samples[1][i] : l;
+        outbuf[i * 2]     = (int32_t)l;
+        outbuf[i * 2 + 1] = (int32_t)r;
     }
 
     return MP2_NONE;

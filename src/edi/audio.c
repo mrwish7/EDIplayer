@@ -73,10 +73,11 @@ static bool superframe_sync(const uint8_t *sf)
  *   byte 2: esc_count (8 bits, only if count == 255)
  *   then count (+ esc_count) bytes: [X-PAD (reversed)] [F-PAD]
  */
-static void au_check_pad(audio_ctx_t *ctx, const uint8_t *au, size_t au_len)
+/* Returns the size of the PAD DSE (header + data), 0 if the AU has none */
+static size_t au_check_pad(audio_ctx_t *ctx, const uint8_t *au, size_t au_len)
 {
     if (au_len < 3 || (au[0] >> 5) != 4)
-        return;
+        return 0;
 
     size_t pad_start = 2;
     size_t pad_len   = au[1];
@@ -85,11 +86,12 @@ static void au_check_pad(audio_ctx_t *ctx, const uint8_t *au, size_t au_len)
         pad_start++;
     }
     if (pad_len < FPAD_LEN || au_len < pad_start + pad_len)
-        return;
+        return 0;
 
     ctx->pad_frames++;
     ctx->cb(ctx->opaque, au + pad_start, pad_len - FPAD_LEN, true,
             au + pad_start + pad_len - FPAD_LEN);
+    return pad_start + pad_len;
 }
 
 static void process_superframe(audio_ctx_t *ctx)
@@ -163,7 +165,9 @@ static void process_superframe(audio_ctx_t *ctx)
         ctx->au_ok++;
         if (ctx->data_cb)
             ctx->data_cb(ctx->data_opaque, AUDIO_DABPLUS, sf[2], au, au_len);
-        au_check_pad(ctx, au, au_len);
+        size_t dse = au_check_pad(ctx, au, au_len);
+        ctx->pad_bytes   += dse;
+        ctx->audio_bytes += au_len - dse;
     }
 }
 
@@ -229,7 +233,10 @@ static void feed_mp2(audio_ctx_t *ctx, const uint8_t *f, size_t len)
      * ScF-CRC and let the CI list delimit it */
     size_t xpad_len = len - hdr_len - scf_crc_len - FPAD_LEN;
     ctx->pad_frames++;
-    ctx->cb(ctx->opaque, f + hdr_len, xpad_len, false, f + len - FPAD_LEN);
+    size_t used = ctx->cb(ctx->opaque, f + hdr_len, xpad_len, false, f + len - FPAD_LEN);
+    if (used > xpad_len) used = xpad_len;
+    ctx->pad_bytes   += FPAD_LEN + used;
+    ctx->audio_bytes += len - FPAD_LEN - used;
 }
 
 /* -------------------------------------------------------------------------

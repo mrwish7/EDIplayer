@@ -51,6 +51,6 @@ typedef struct {
 void pad_init(pad_ctx_t *ctx, dls_ctx_t *dls, mot_ctx_t *mot);
 
 /* PAD callback for the audio layer (see audio.h pad_cb_t).
- * opaque must be a pad_ctx_t*. */
-void pad_process(void *opaque, const uint8_t *xpad, size_t xpad_len,
-                 bool exact_xpad_len, const uint8_t *fpad);
+ * opaque must be a pad_ctx_t*. Returns the X-PAD bytes in use. */
+size_t pad_process(void *opaque, const uint8_t *xpad, size_t xpad_len,
+                   bool exact_xpad_len, const uint8_t *fpad);

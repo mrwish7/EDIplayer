@@ -7,8 +7,14 @@
 // starts once kPrefillMs are buffered; on underrun it pauses and refills, and
 // if the FIFO grows too large (clock drift, network bursts) the excess is
 // dropped; in between, playback speed is nudged by up to 0.2 % to follow the
-// sender's clock. The device is (re)opened at the stream's sample rate; miniaudio
+// sender's clock, using a 32-tap windowed-sinc interpolator (linear
+// interpolation was audibly gritty: its error was only ~27 dB below the
+// music). The device is (re)opened at the stream's sample rate; miniaudio
 // converts to the device's native rate if needed.
+//
+// Samples are float throughout, so peaks slightly above full scale reach the
+// system mixer intact (where the system volume normally brings them back into
+// range) instead of being hard-clipped here.
 
 #include "player.h"
 
@@ -24,7 +30,7 @@ public:
     AudioOut();
     ~AudioOut() override;
 
-    void pcm(const int16_t *data, size_t frames, int rate) override;
+    void pcm(const float *data, size_t frames, int rate) override;
     void flush() override;
 
     void setVolume(float v) { volume_ = v; }
@@ -38,7 +44,7 @@ public:
     uint32_t underruns() const { return underruns_; }
 
     // miniaudio callback
-    void render(int16_t *out, size_t frames);
+    void render(float *out, size_t frames);
 
 private:
     bool openDevice(int rate);
@@ -53,8 +59,12 @@ private:
     std::atomic<bool> failed_{false};
     int failedRate_ = 0;
 
+    // windowed-sinc interpolator: taps x[head-15] .. x[head+16]
+    static const int kTaps = 32, kBefore = 15, kAfter = 16, kPhases = 256;
+
     mutable std::mutex mutex_;          // guards the FIFO
-    std::vector<int16_t> fifo_;         // ring of interleaved stereo frames
+    std::vector<float> fifo_;           // ring of interleaved stereo frames; keeps
+                                        // kBefore frames of history behind head_
     size_t head_ = 0, count_ = 0;       // in frames
     bool playing_ = false;              // false while (re)filling
     double frac_ = 0, speed_ = 1.0;     // fractional read position, playback speed

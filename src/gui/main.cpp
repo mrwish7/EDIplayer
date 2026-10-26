@@ -17,7 +17,12 @@
 #include "backends/imgui_impl_opengl3.h"
 
 #include "core/audio_out.h"
+#include "core/countries.h"
 #include "core/log.h"
+#include "flags_data.h"
+#ifndef _WIN32
+#include "icon_data.h"   // Windows uses the .ico resource instead
+#endif
 #include "core/player.h"
 
 #include <GLFW/glfw3.h>
@@ -36,7 +41,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,6 +62,17 @@ struct SlideTexture {
     std::shared_ptr<const Slide> slide;
 };
 
+struct LogoTextures {
+    SharedBytes smallSrc, largeSrc;    // what the textures were made from
+    GLuint logo32 = 0, logo320 = 0;
+    int largeW = 0, largeH = 0;
+};
+
+struct FlagTexture {
+    GLuint tex = 0;
+    int w = 0, h = 0;
+};
+
 struct App {
     // settings
     char url[256] = "";
@@ -67,6 +85,10 @@ struct App {
     Player player{&audio};
     PlayerSnapshot snap;
     SlideTexture slide;
+    std::map<uint16_t, LogoTextures> logos;
+    uint64_t logosVersion = 0;
+    LogoTextures ensembleLogo;                  // logo32 / smallSrc only
+    std::map<std::string, FlagTexture> flags;   // by ISO code
     std::string message;               // last start error
     std::deque<std::string> log;
     size_t logCounter = 0;
@@ -86,15 +108,43 @@ static double now()
 // ---------------------------------------------------------------------------
 // Settings (key=value text file)
 
+static std::string executableDir()
+{
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    char u8[MAX_PATH * 3];
+    int m = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, u8, sizeof(u8), nullptr, nullptr);
+    std::string p(u8, m > 0 ? (size_t)m : 0);
+    size_t s = p.find_last_of("\\/");
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    std::string p = n > 0 ? std::string(buf, (size_t)n) : ".";
+    size_t s = p.rfind('/');
+#endif
+    return s == std::string::npos ? "." : p.substr(0, s);
+}
+
+// EDIplayer_SPI/ goes next to the program; on Linux fall back to the config
+// folder when the program is installed somewhere read-only
+static std::string spiBaseDir()
+{
+    std::string d = executableDir();
+#ifndef _WIN32
+    if (access(d.c_str(), W_OK) != 0) {
+        const char *xdg = getenv("XDG_CONFIG_HOME");
+        d = (xdg && *xdg ? std::string(xdg) : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.config") + "/ediplayer";
+    }
+#endif
+    return d;
+}
+
 static std::string settingsFile()
 {
 #ifdef _WIN32
     // next to the executable, as dab2edi-gui does
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    std::string p(buf, n);
-    size_t s = p.find_last_of("\\/");
-    return (s == std::string::npos ? std::string(".") : p.substr(0, s)) + "\\EDIplayer.ini";
+    return executableDir() + "\\EDIplayer.ini";
 #else
     const char *xdg = getenv("XDG_CONFIG_HOME");
     std::string dir = xdg && *xdg ? xdg : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.config";
@@ -106,7 +156,7 @@ static std::string settingsFile()
 
 static void loadSettings(App &a)
 {
-    std::ifstream f(a.settingsPath);
+    std::ifstream f(std::filesystem::u8path(a.settingsPath));
     std::string line;
     while (std::getline(f, line)) {
         size_t eq = line.find('=');
@@ -121,7 +171,7 @@ static void loadSettings(App &a)
 
 static void saveSettings(const App &a)
 {
-    std::ofstream f(a.settingsPath);
+    std::ofstream f(std::filesystem::u8path(a.settingsPath));
     if (!f) return;
     char sid[16] = "";
     if (a.lastSid >= 0) snprintf(sid, sizeof(sid), "%04X", a.lastSid);
@@ -139,9 +189,22 @@ static void addRecent(App &a, const std::string &url)
 // ---------------------------------------------------------------------------
 // Player control
 
+static void clearLogos(App &a)
+{
+    for (auto &l : a.logos) {
+        if (l.second.logo32) glDeleteTextures(1, &l.second.logo32);
+        if (l.second.logo320) glDeleteTextures(1, &l.second.logo320);
+    }
+    a.logos.clear();
+    if (a.ensembleLogo.logo32) glDeleteTextures(1, &a.ensembleLogo.logo32);
+    a.ensembleLogo = LogoTextures();
+    a.logosVersion = 0;
+}
+
 static void startPlayer(App &a)
 {
     if (a.player.running()) return;
+    clearLogos(a);
     std::string err;
     a.player.select(a.lastSid);
     if (!a.player.start(a.url, err)) {
@@ -169,41 +232,135 @@ static void playService(App &a, int sid)
     saveSettings(a);
 }
 
+// Decode an image file into texture `tex` (created if 0). Returns false if
+// the image can't be decoded.
+// Shrink RGBA pixels so the longer side is maxSide, averaging the source area
+// of each output pixel (alpha-weighted, so transparent edges don't darken).
+// Plain bilinear sampling of a much larger texture looks jagged.
+static std::vector<uint8_t> shrinkRgba(const uint8_t *src, int w, int h, int maxSide, int &ow, int &oh)
+{
+    const float k = (float)maxSide / (float)std::max(w, h);
+    ow = std::max(1, (int)lroundf(w * k));
+    oh = std::max(1, (int)lroundf(h * k));
+    std::vector<uint8_t> out((size_t)ow * oh * 4);
+    for (int oy = 0; oy < oh; oy++) {
+        const int y0 = oy * h / oh, y1 = std::max(y0 + 1, (oy + 1) * h / oh);
+        for (int ox = 0; ox < ow; ox++) {
+            const int x0 = ox * w / ow, x1 = std::max(x0 + 1, (ox + 1) * w / ow);
+            double r = 0, g = 0, b = 0, a = 0;
+            for (int y = y0; y < y1; y++)
+                for (int x = x0; x < x1; x++) {
+                    const uint8_t *p = src + ((size_t)y * w + x) * 4;
+                    r += p[0] * p[3];
+                    g += p[1] * p[3];
+                    b += p[2] * p[3];
+                    a += p[3];
+                }
+            uint8_t *q = &out[((size_t)oy * ow + ox) * 4];
+            const int n = (x1 - x0) * (y1 - y0);
+            q[0] = a > 0 ? (uint8_t)lround(r / a) : 0;
+            q[1] = a > 0 ? (uint8_t)lround(g / a) : 0;
+            q[2] = a > 0 ? (uint8_t)lround(b / a) : 0;
+            q[3] = (uint8_t)lround(a / n);
+        }
+    }
+    return out;
+}
+
+// Decode an image into texture `tex` (created if 0). With maxSide > 0 the
+// image is first shrunk to about that size. w/h return the decoded image's
+// size; false if it can't be decoded.
+static bool loadTexture(const std::vector<uint8_t> &d, GLuint &tex, int &w, int &h, const char *what, int maxSide = 0)
+{
+    int n;
+    unsigned char *px = stbi_load_from_memory(d.data(), (int)d.size(), &w, &h, &n, 4);
+    if (!px) {
+        applog::add(std::string(what) + ": cannot decode image: " + stbi_failure_reason());
+        w = h = 0;
+        return false;
+    }
+    int tw = w, th = h;
+    std::vector<uint8_t> small;
+    const uint8_t *data = px;
+    if (maxSide > 0 && std::max(w, h) > maxSide + maxSide / 2) {
+        small = shrinkRgba(px, w, h, maxSide, tw, th);
+        data = small.data();
+    }
+    if (!tex) glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    stbi_image_free(px);
+    return true;
+}
+
 // Decode a new slide into the texture (on the GUI thread)
 static void updateSlide(App &a)
 {
     if (a.snap.slideVersion == a.slide.version) return;
     a.slide.version = a.snap.slideVersion;
     a.slide.slide = a.snap.slide;
-    if (!a.snap.slide) {
-        a.slide.w = a.slide.h = 0;
-        return;
+    a.slide.w = a.slide.h = 0;
+    if (a.snap.slide) loadTexture(a.snap.slide->data, a.slide.tex, a.slide.w, a.slide.h, "SLS");
+}
+
+// Make textures for new or changed SPI logos
+static void updateLogos(App &a)
+{
+    if (a.snap.logosVersion == a.logosVersion) return;
+    a.logosVersion = a.snap.logosVersion;
+    if (a.snap.ensembleLogo && a.snap.ensembleLogo != a.ensembleLogo.smallSrc) {
+        int w, h;
+        a.ensembleLogo.smallSrc = a.snap.ensembleLogo;
+        loadTexture(*a.snap.ensembleLogo, a.ensembleLogo.logo32, w, h, "SPI ensemble logo",
+                    (int)lroundf(32 * ImGui::GetStyle().FontScaleDpi));
     }
-    int w, h, n;
-    const auto &d = a.snap.slide->data;
-    unsigned char *px = stbi_load_from_memory(d.data(), (int)d.size(), &w, &h, &n, 4);
-    if (!px) {
-        applog::add(std::string("SLS: cannot decode image: ") + stbi_failure_reason());
-        a.slide.w = a.slide.h = 0;
-        return;
+    for (const auto &l : a.snap.logos) {
+        LogoTextures &t = a.logos[l.first];
+        int w, h;
+        if (l.second.logo32 && l.second.logo32 != t.smallSrc) {
+            t.smallSrc = l.second.logo32;
+            // the list icon may be a larger square (e.g. 128x128): shrink it to its display size
+            loadTexture(*l.second.logo32, t.logo32, w, h, "SPI logo", (int)lroundf(32 * ImGui::GetStyle().FontScaleDpi));
+        }
+        if (l.second.logo320 && l.second.logo320 != t.largeSrc) {
+            t.largeSrc = l.second.logo320;
+            if (!loadTexture(*l.second.logo320, t.logo320, t.largeW, t.largeH, "SPI logo")) t.largeW = t.largeH = 0;
+        }
     }
-    if (!a.slide.tex) glGenTextures(1, &a.slide.tex);
-    glBindTexture(GL_TEXTURE_2D, a.slide.tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    stbi_image_free(px);
-    a.slide.w = w;
-    a.slide.h = h;
+}
+
+// Flag for an ISO country code, decoded from the embedded PNGs on first use
+static const FlagTexture *flagTexture(App &a, const char *iso)
+{
+    auto it = a.flags.find(iso);
+    if (it != a.flags.end()) return it->second.tex ? &it->second : nullptr;
+    FlagTexture &f = a.flags[iso];
+    for (const auto &k : kFlags) {
+        if (strcmp(k.iso, iso) != 0) continue;
+        std::vector<uint8_t> png(k.data, k.data + k.size);
+        // drawn about one line high, so shrink the 40 px high images to match
+        if (!loadTexture(png, f.tex, f.w, f.h, "flag", (int)lroundf(32 * ImGui::GetStyle().FontScaleDpi))) f.tex = 0;
+        break;
+    }
+    return f.tex ? &f : nullptr;
+}
+
+static const LogoTextures *findLogos(const App &a, int sid)
+{
+    auto it = a.logos.find((uint16_t)sid);
+    return it == a.logos.end() ? nullptr : &it->second;
 }
 
 static void pollPlayer(App &a)
 {
     a.snap = a.player.snapshot();
     updateSlide(a);
+    updateLogos(a);
 
     std::vector<std::string> lines;
     a.logCounter = applog::fetch(a.logCounter, lines);
@@ -225,12 +382,19 @@ static void pollPlayer(App &a)
 static ImU32 col(float r, float g, float b, float al = 1.0f) { return ImGui::GetColorU32(ImVec4(r, g, b, al)); }
 static const ImVec4 kAccent(0.20f, 0.55f, 0.95f, 1.0f);
 
+// Hand pointer over clickable items (disabled items don't report hovering)
+static void handCursor()
+{
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+}
+
 enum Icon { IconPlay, IconStop };
 
 static bool iconButton(const char *id, Icon icon, float size, ImU32 bg, ImU32 fg, const char *tip)
 {
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool pressed = ImGui::InvisibleButton(id, ImVec2(size, size));
+    handCursor();
     bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 c(p.x + size * 0.5f, p.y + size * 0.5f);
@@ -355,12 +519,15 @@ static void drawSourceBar(App &a)
                           "  udp://group:port?iface=ip  ... on a specific interface");
     ImGui::SameLine();
     if (ImGui::ArrowButton("##recent", ImGuiDir_Down)) ImGui::OpenPopup("recent");
+    handCursor();
     if (ImGui::IsItemHovered() && !running) ImGui::SetTooltip("Recent sources");
     ImGui::EndDisabled();
     if (ImGui::BeginPopup("recent")) {
         if (a.recent.empty()) ImGui::TextDisabled("No recent sources");
-        for (const auto &r : a.recent)
+        for (const auto &r : a.recent) {
             if (ImGui::Selectable(r.c_str())) snprintf(a.url, sizeof(a.url), "%s", r.c_str());
+            handCursor();
+        }
         ImGui::EndPopup();
     }
 
@@ -377,21 +544,91 @@ static void drawSourceBar(App &a)
     endPanel();
 }
 
+// "SPI  12 / 33" with a thin bar while the SPI carousel loads
+static void drawSpiProgress(App &a)
+{
+    const SpiProgress &pr = a.snap.spi;
+    if (!a.player.running() || pr.carousels == 0) return;
+
+    const bool done = pr.directory && pr.objects > 0 && pr.complete >= pr.objects;
+    char txt[64];
+    if (!pr.directory) snprintf(txt, sizeof(txt), "SPI  waiting for directory");
+    else if (done) snprintf(txt, sizeof(txt), "SPI  %d files loaded", pr.objects);
+    else snprintf(txt, sizeof(txt), "SPI  %d / %d", pr.complete, pr.objects);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextUnformatted(txt);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Service and Programme Information: station logos.\nFiles are saved to\n%s",
+                          a.snap.spiFolder.empty() ? "(waiting for the ensemble ID)" : a.snap.spiFolder.c_str());
+    if (done) return;
+
+    // progress bar (moving segment until the directory has arrived)
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float h = 3.0f * ImGui::GetStyle().FontScaleDpi;
+    const float w = ImGui::GetContentRegionAvail().x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(1, 1, 1, 0.07f), h * 0.5f);
+    const ImU32 c = ImGui::GetColorU32(kAccent);
+    if (pr.directory && pr.objects > 0) {
+        const float f = (float)pr.complete / pr.objects;
+        if (f > 0) dl->AddRectFilled(p, ImVec2(p.x + std::max(h, w * f), p.y + h), c, h * 0.5f);
+    } else {
+        const float seg = w * 0.25f;
+        const float x = (float)fmod(now() * 0.6, 1.0) * (w + seg) - seg;
+        dl->AddRectFilled(ImVec2(p.x + std::max(0.0f, x), p.y), ImVec2(p.x + std::min(w, x + seg), p.y + h), c, h * 0.5f);
+    }
+    ImGui::Dummy(ImVec2(w, h));
+}
+
 static void drawServices(App &a, float width)
 {
     beginPanel("services", ImVec2(width, 0));
     const PlayerSnapshot &s = a.snap;
 
-    // ensemble header
+    // ensemble header, with the country flag on the right
+    const Country *country = s.ecc >= 0 && !s.services.empty() ? dabCountry((uint8_t)s.ecc, s.eid) : nullptr;
+    const FlagTexture *flag = country ? flagTexture(a, country->iso) : nullptr;
+    const float flagH = ImGui::GetFontSize() * 0.95f;
+    const float flagW = flag ? flagH * flag->w / flag->h : 0;
     std::string ens = s.ensemble.empty() ? "Services" : s.ensemble;
-    ImGui::TextUnformatted(fitText(ens, ImGui::GetContentRegionAvail().x).c_str());
+    const ImVec2 hp = ImGui::GetCursorScreenPos();
+    const float hw = ImGui::GetContentRegionAvail().x;
+
+    // ensemble logo (SPI) to the left of the name and the "N services" line
+    const bool ensLogo = a.ensembleLogo.logo32 != 0 && !s.services.empty();
+    const float ensScale = ImGui::GetStyle().FontScaleDpi;
+    const float ensLogoSz = 32 * ensScale;
+    const float ensIndent = ensLogo ? ensLogoSz + ImGui::GetStyle().ItemSpacing.x * 1.2f : 0;
+    if (ensLogo) {
+        const float linesH = ImGui::GetTextLineHeight() * 2 + ImGui::GetStyle().ItemSpacing.y;
+        const ImVec2 lp(hp.x, hp.y + (linesH - ensLogoSz) * 0.5f);
+        ImGui::GetWindowDrawList()->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)a.ensembleLogo.logo32), lp,
+                                                    ImVec2(lp.x + ensLogoSz, lp.y + ensLogoSz), ImVec2(0, 0), ImVec2(1, 1),
+                                                    IM_COL32_WHITE, 4.0f * ensScale);
+        ImGui::Indent(ensIndent);
+    }
+    ImGui::TextUnformatted(fitText(ens, hw - ensIndent - (flag ? flagW + ImGui::GetStyle().ItemSpacing.x : 0)).c_str());
+    if (flag) {
+        const ImVec2 fp(hp.x + hw - flagW, hp.y + (ImGui::GetTextLineHeight() - flagH) * 0.5f);
+        ImGui::GetWindowDrawList()->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)flag->tex), fp,
+                                                    ImVec2(fp.x + flagW, fp.y + flagH), ImVec2(0, 0), ImVec2(1, 1),
+                                                    IM_COL32_WHITE, 2.0f * ImGui::GetStyle().FontScaleDpi);
+        if (ImGui::IsMouseHoveringRect(fp, ImVec2(fp.x + flagW, fp.y + flagH)))
+            ImGui::SetTooltip("%s\nECC %02X, country id %X", country->name, s.ecc, s.eid >> 12);
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     char sub[96] = "";
-    if (!s.services.empty())
+    if (!s.services.empty()) {
         snprintf(sub, sizeof(sub), "%zu service%s   EId %04X", s.services.size(), s.services.size() == 1 ? "" : "s",
                  s.eid);
+        if (s.ecc >= 0) snprintf(sub + strlen(sub), sizeof(sub) - strlen(sub), "   ECC %02X", s.ecc);
+    }
     ImGui::TextUnformatted(sub[0] ? sub : (a.player.running() ? "Waiting for the FIC..." : "Not receiving"));
     ImGui::PopStyleColor();
+    if (ensLogo) ImGui::Unindent(ensIndent);
+    drawSpiProgress(a);
     ImGui::Spacing();
 
     ImGui::BeginChild("list", ImVec2(0, 0), 0, ImGuiWindowFlags_NoBackground);
@@ -406,8 +643,12 @@ static void drawServices(App &a, float width)
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
     const float fs = ImGui::GetFontSize();
+    const float scale = ImGui::GetStyle().FontScaleDpi;
     const float rowH = fs * 2.0f + ImGui::GetStyle().FramePadding.y * 2;
     const float padX = ImGui::GetStyle().FramePadding.x;
+    const float logoSz = std::min(32 * scale, rowH - 6 * scale);   // SPI 32x32 logo
+    const float logoX = padX * 0.7f;
+    const float textX = logoX + logoSz + padX * 0.8f;
     for (const auto &e : s.services) {
         ImGui::PushID(e.sid);
         const bool sel = e.sid == s.selectedSid;
@@ -417,6 +658,7 @@ static void drawServices(App &a, float width)
             a.scrollToSelected = false;
             if (!sel) playService(a, e.sid);
         }
+        if (!sel) handCursor();
         const bool hov = ImGui::IsItemHovered();
         // resumed service: keep it in view while labels arrive and re-sort the list
         const int index = (int)(&e - s.services.data());
@@ -433,19 +675,50 @@ static void drawServices(App &a, float width)
         char sidName[24];
         snprintf(sidName, sizeof(sidName), "SId %04X", e.sid);
         const std::string name = e.label.empty() ? sidName : e.label;
+        // logo square: the SPI 32x32 logo, or an empty placeholder until it arrives
+        const ImVec2 lp(p.x + logoX, p.y + (rowH - logoSz) * 0.5f);
+        const LogoTextures *lt = findLogos(a, e.sid);
+        if (lt && lt->logo32)
+            dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)lt->logo32), lp, ImVec2(lp.x + logoSz, lp.y + logoSz),
+                                ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 4.0f * scale);
+        else
+            dl->AddRectFilled(lp, ImVec2(lp.x + logoSz, lp.y + logoSz), col(1, 1, 1, 0.05f), 4.0f * scale);
+
         const float ty = p.y + (rowH - fs * 2.05f) * 0.5f;
-        dl->AddText(ImVec2(p.x + padX, ty), ImGui::GetColorU32(ImGuiCol_Text),
-                    fitText(name, w - padX * 2 - barsW).c_str());
-        char info[64];
-        snprintf(info, sizeof(info), "%s  %d kbit/s", e.dabplus ? "DAB+" : "DAB", e.kbps);
-        dl->AddText(ImVec2(p.x + padX, ty + fs * 1.05f), ImGui::GetColorU32(ImGuiCol_TextDisabled), info);
+        // details in a smaller font: the SId after the name, and a second line with
+        // type, bitrate, protection, programme type
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.85f);
+        const float sfs = ImGui::GetFontSize();
+        const ImU32 detailCol = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+        char sidHex[8];
+        snprintf(sidHex, sizeof(sidHex), "%04X", e.sid);
+        const bool showSid = !e.label.empty();   // otherwise the name already is "SId XXXX"
+        const float sidGap = fs * 0.45f;
+        const float sidW = showSid ? ImGui::CalcTextSize(sidHex).x + sidGap : 0;
+        ImGui::PopFont();
+
+        const std::string shownName = fitText(name, w - textX - padX - barsW - sidW);
+        dl->AddText(ImVec2(p.x + textX, ty), ImGui::GetColorU32(ImGuiCol_Text), shownName.c_str());
+        const float nameW = ImGui::CalcTextSize(shownName.c_str()).x;
+
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.85f);
+        if (showSid)   // on the name's baseline
+            dl->AddText(ImGui::GetFont(), sfs, ImVec2(p.x + textX + nameW + sidGap, ty + (fs - sfs) * 0.78f), detailCol, sidHex);
+        std::string info = std::string(e.dabplus ? "DAB+" : "DAB") + " \xC2\xB7 " + std::to_string(e.kbps) + " kbit/s";
+        if (!e.protection.empty()) info += " \xC2\xB7 " + e.protection;
+        if (e.pty > 0) info += std::string(" \xC2\xB7 ") + Player::ptyName(e.pty);
+        dl->AddText(ImGui::GetFont(), sfs, ImVec2(p.x + textX, ty + fs * 1.12f), detailCol,
+                    fitText(info, w - textX - padX - barsW).c_str());
+        ImGui::PopFont();
         if (sel)
             drawPlayingBars(dl, ImVec2(p.x + w - padX - fs * 0.85f, p.y + (rowH - fs) * 0.5f), fs,
                             std::max(a.audio.peakLeft(), a.audio.peakRight()), s.audioOk && a.player.running(),
                             ImGui::GetColorU32(kAccent));
         if (hov) {
-            ImGui::SetTooltip("%s\nSId %04X   SubChId %d\n%s, %d kbit/s", name.c_str(), e.sid, e.scid,
-                              e.dabplus ? "DAB+ (HE-AAC)" : "DAB (MPEG Layer II)", e.kbps);
+            ImGui::SetTooltip("%s\nSId %04X   SubChId %d\n%s, %d kbit/s%s%s\nProgramme type: %s", name.c_str(), e.sid,
+                              e.scid, e.dabplus ? "DAB+ (HE-AAC)" : "DAB (MPEG Layer II)", e.kbps,
+                              e.protection.empty() ? "" : ", ", e.protection.c_str(),
+                              e.pty > 0 ? Player::ptyName(e.pty) : e.pty == 0 ? "none" : "unknown");
         }
         ImGui::PopID();
     }
@@ -476,6 +749,186 @@ static void drawVolume(App &a, float width)
     if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings(a);
 }
 
+static ImFont *g_boldFont = nullptr;   // loaded in loadFont(); nullptr if none was found
+
+// Record pill geometry: compact, sized to sit on a line of text; the label
+// is small bold capitals
+struct PillMetrics {
+    float h, icon, padX, gap, textSize;
+    ImFont *font;
+    PillMetrics()
+    {
+        const float fs = ImGui::GetFontSize();
+        h = fs * 1.3f;
+        icon = fs * 0.5f;
+        padX = fs * 0.45f;
+        gap = fs * 0.3f;
+        textSize = fs * 0.8f;
+        font = g_boldFont ? g_boldFont : ImGui::GetFont();
+    }
+    float textWidth(const char *t) const { return font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, t).x; }
+};
+
+static void pillText(char *txt, size_t n, const char *label, const Recorder::State &st)
+{
+    if (!st.active) {
+        snprintf(txt, n, "%s", label);
+        return;
+    }
+    int t = (int)st.seconds;
+    if (t >= 3600) snprintf(txt, n, "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60);
+    else snprintf(txt, n, "%02d:%02d", t / 60, t % 60);
+}
+
+static float pillWidth(const char *txt)
+{
+    PillMetrics m;
+    // fits "00:00" so the pill doesn't change width when it starts
+    const float textW = std::max(m.textWidth("00:00"), m.textWidth(txt));
+    return m.padX + m.icon + m.gap + textW + m.padX;
+}
+
+// Pill button: round red record dot + label, or (while recording) a stop
+// square + elapsed time on a red tint
+static bool recordPill(const char *id, const char *label, const Recorder::State &st, bool enabled, const char *tip)
+{
+    const PillMetrics m;
+    const float h = m.h, icon = m.icon, padX = m.padX;
+    char txt[32];
+    pillText(txt, sizeof(txt), label, st);
+    const float w = pillWidth(txt);
+
+    ImGui::BeginDisabled(!enabled && !st.active);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool pressed = ImGui::InvisibleButton(id, ImVec2(w, h));
+    handCursor();
+    const bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec4 bg = st.active ? ImVec4(0.80f, 0.22f, 0.22f, 0.30f) : ImGui::GetStyleColorVec4(ImGuiCol_Button);
+    if (hov) { bg.x *= 1.2f; bg.y *= 1.2f; bg.z *= 1.2f; }
+    if (act) { bg.x *= 0.85f; bg.y *= 0.85f; bg.z *= 0.85f; }
+    if (!enabled && !st.active) bg.w *= 0.5f;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(bg), h * 0.5f);
+
+    const ImVec2 c(p.x + padX + icon * 0.5f, p.y + h * 0.5f);
+    const ImU32 red = (!enabled && !st.active) ? col(0.55f, 0.30f, 0.30f) : col(0.92f, 0.26f, 0.24f);
+    if (st.active) {
+        // stop square, gently pulsing so a running recording is obvious
+        const float pulse = 0.75f + 0.25f * (float)sin(now() * 4.0);
+        const float s = icon * 0.42f;
+        dl->AddRectFilled(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s),
+                          ImGui::GetColorU32(ImVec4(0.92f, 0.26f, 0.24f, pulse)), s * 0.3f);
+    } else {
+        dl->AddCircleFilled(c, icon * 0.45f, red, 24);
+    }
+    const ImU32 tc = ImGui::GetColorU32((!enabled && !st.active) ? ImGuiCol_TextDisabled : ImGuiCol_Text);
+    const ImVec2 tp(p.x + padX + icon + m.gap, p.y + (h - m.textSize) * 0.5f);
+    dl->AddText(m.font, m.textSize, tp, tc, txt);
+    if (!g_boldFont) dl->AddText(m.font, m.textSize, ImVec2(tp.x + 0.7f, tp.y), tc, txt);   // poor man's bold
+    ImGui::EndDisabled();
+    if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tip);
+    return pressed;
+}
+
+// Width of the two record pills, for laying them out after the codec text
+static float recorderWidth(const PlayerSnapshot &s)
+{
+    char t0[32], t1[32];
+    pillText(t0, sizeof(t0), "RAW", s.rec[Recorder::Raw]);
+    pillText(t1, sizeof(t1), "WAV", s.rec[Recorder::Wav]);
+    return pillWidth(t0) + ImGui::GetStyle().ItemSpacing.x * 0.6f + pillWidth(t1);
+}
+
+static void drawRecorder(App &a, const ServiceEntry *svc)
+{
+    const PlayerSnapshot &s = a.snap;
+    const bool can = a.player.running() && svc;
+    const char *rawExt = svc && svc->dabplus ? ".aac (LATM)" : ".mp2";
+    const Recorder::Kind kinds[2] = {Recorder::Raw, Recorder::Wav};
+    const char *labels[2] = {"RAW", "WAV"};
+    const float y = ImGui::GetCursorPosY();   // SameLine would realign the second pill to the text
+    for (int i = 0; i < 2; i++) {
+        const Recorder::State &st = s.rec[kinds[i]];
+        std::string tip;
+        if (st.active) tip = "Recording to\n" + st.file + "\nClick to stop";
+        else if (!can) tip = "Play a service to record it";
+        else if (i == 0) tip = std::string("Record the broadcast audio unchanged (") + rawExt + ") into EDIplayer_audio";
+        else tip = "Record the decoded audio as a WAV file into EDIplayer_audio";
+        if (i) {
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 0.6f);
+            ImGui::SetCursorPosY(y);
+        }
+        if (recordPill(i ? "##recwav" : "##recraw", labels[i], st, can, tip.c_str())) {
+            if (st.active) {
+                a.player.stopRecording(kinds[i]);
+            } else {
+                std::string err;
+                if (!a.player.startRecording(kinds[i], err)) a.message = err;
+                else a.message.clear();
+            }
+        }
+    }
+}
+
+static bool g_forceRateTooltip = false;   // test hook EDIPLAYER_RATES
+
+// Dotted underline under the bitrate text (r0-r1; hints that it has a
+// tooltip), and the live bitrate breakdown when hovered
+static void drawRateTooltip(const PlayerSnapshot &s, const ServiceEntry *svc, ImVec2 r0, ImVec2 r1, bool hovered)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImU32 c = ImGui::GetColorU32(ImGuiCol_TextDisabled, 0.6f);
+    const float dot = std::max(1.0f, ImGui::GetStyle().FontScaleDpi);
+    for (float x = r0.x; x < r1.x; x += dot * 3) dl->AddRectFilled(ImVec2(x, r1.y), ImVec2(x + dot, r1.y + dot), c);
+
+    if (!hovered && !g_forceRateTooltip) return;
+    const PlayerSnapshot::Rates &r = s.rates;
+    ImGui::SetNextWindowPos(ImVec2(r0.x, r1.y + ImGui::GetStyle().ItemSpacing.y));   // just below the bitrate
+    ImGui::BeginTooltip();
+    if (!r.valid) {
+        ImGui::TextUnformatted("Measuring...");
+        ImGui::EndTooltip();
+        return;
+    }
+    ImGui::TextUnformatted("Bitrate breakdown (last ~4 s)");
+    ImGui::Separator();
+    auto pct = [&](double v) { return r.useful > 0 ? 100.0 * v / r.useful : 0.0; };
+    auto row = [&](const char *name, double kbps, double percent, const char *note) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(name);
+        ImGui::TableSetColumnIndex(1);
+        char b[32];
+        snprintf(b, sizeof(b), "%.1f kbit/s", kbps);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(b).x);
+        ImGui::TextUnformatted(b);
+        ImGui::TableSetColumnIndex(2);
+        if (percent >= 0) {
+            snprintf(b, sizeof(b), "%.1f %%", percent);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(b).x);
+            ImGui::TextDisabled("%s", b);
+        }
+        ImGui::TableSetColumnIndex(3);
+        if (note) ImGui::TextDisabled("%s", note);
+    };
+    if (ImGui::BeginTable("rates", 4, ImGuiTableFlags_SizingFixedFit)) {
+        // number columns sized up front so right-aligned values aren't clipped on the first frame
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
+                                std::max(ImGui::CalcTextSize("Sub-channel").x, ImGui::CalcTextSize("  Overhead").x));
+        ImGui::TableSetupColumn("kbps", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("000.0 kbit/s").x);
+        ImGui::TableSetupColumn("pct", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("100.0 %").x);
+        ImGui::TableSetupColumn("note", ImGuiTableColumnFlags_WidthFixed);
+        std::string sub = svc && !svc->protection.empty() ? svc->protection : "";
+        row("Sub-channel", r.subchannel, -1, sub.empty() ? nullptr : sub.c_str());
+        row("Useful", r.useful, 100.0, r.dabplus ? "after Reed-Solomon (110/120)" : "no outer FEC in DAB (MP2)");
+        row("  Audio", r.audio, pct(r.audio), r.dabplus ? "AAC access units" : "MPEG frames incl. header/CRC");
+        row("  PAD", r.pad, pct(r.pad), r.dabplus ? "DLS, slideshow... (DSE)" : "F-PAD + X-PAD in use");
+        if (r.dabplus) row("  Overhead", r.overhead, pct(r.overhead), "superframe header, AU CRCs, padding");
+        ImGui::EndTable();
+    }
+    ImGui::EndTooltip();
+}
+
 static void drawNowPlaying(App &a)
 {
     beginPanel("now", ImVec2(0, 0));
@@ -487,22 +940,62 @@ static void drawNowPlaying(App &a)
     // header: station + format, volume on the right
     ImGui::BeginGroup();
     const float textW = ImGui::GetContentRegionAvail().x - volW - ImGui::GetStyle().ItemSpacing.x * 2;
+    // three tightly spaced lines: name, "SId D3A3 · Pop Music", codec + record pills
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f * scale));
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.45f);
     std::string title = svc && !svc->label.empty() ? svc->label : s.selectedSid >= 0 ? "Tuning..." : "No service selected";
     ImGui::TextUnformatted(fitText(title, textW).c_str());
     ImGui::PopFont();
-    std::string det;
+    if (svc) {
+        char ident[64];
+        snprintf(ident, sizeof(ident), "SId %04X", svc->sid);
+        std::string line = ident;
+        if (svc->pty > 0) line += std::string(" \xC2\xB7 ") + Player::ptyName(svc->pty);
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.85f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextUnformatted(fitText(line, textW).c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+    }
+    // codec line: "<format>  -  <bitrate>  -  buffering"; the bitrate is its own
+    // item with a live breakdown tooltip
+    std::string det, rate, tail;
     if (s.selectedSid >= 0 && a.player.running()) {
         if (!s.audioFormat.empty()) det = s.audioFormat;
         else if (svc) det = svc->dabplus ? "DAB+" : "DAB";
-        if (svc) det += "  -  " + std::to_string(svc->kbps) + " kbit/s";
-        if (!s.audioOk) det += "  -  buffering";
+        if (svc) rate = std::to_string(svc->kbps) + " kbit/s";
+        if (!s.audioOk) tail = "  -  buffering";
     } else if (s.selectedSid < 0) {
         det = "Choose a service from the list";
     }
+    // record pills go to the right of it, centred on the text
+    const float recW = recorderWidth(s);
+    const float recGap = ImGui::GetStyle().ItemSpacing.x * 1.5f;
+    const std::string sep = rate.empty() ? "" : "  -  ";
+    const float fixedW = ImGui::CalcTextSize((sep + rate + tail).c_str()).x;
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextUnformatted(fitText(det, textW).c_str());
+    ImGui::TextUnformatted(fitText(det, std::max(0.0f, textW - recW - recGap - fixedW)).c_str());
+    ImVec2 rateMin, rateMax;
+    bool rateHovered = false;
+    if (!rate.empty()) {
+        ImGui::SameLine(0, 0);
+        ImGui::TextUnformatted(sep.c_str());
+        ImGui::SameLine(0, 0);
+        ImGui::TextUnformatted(rate.c_str());
+        rateMin = ImGui::GetItemRectMin();
+        rateMax = ImGui::GetItemRectMax();
+        rateHovered = ImGui::IsItemHovered();
+    }
+    if (!tail.empty()) {
+        ImGui::SameLine(0, 0);
+        ImGui::TextUnformatted(tail.c_str());
+    }
     ImGui::PopStyleColor();
+    if (!rate.empty()) drawRateTooltip(s, svc, rateMin, rateMax, rateHovered);
+    ImGui::SameLine(0, det.empty() ? 0 : recGap);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (PillMetrics().h - ImGui::GetTextLineHeight()) * 0.5f);
+    drawRecorder(a, svc);
+    ImGui::PopStyleVar();
     ImGui::EndGroup();
     ImGui::SameLine(ImGui::GetContentRegionMax().x - volW);
     ImGui::BeginGroup();
@@ -519,11 +1012,17 @@ static void drawNowPlaying(App &a)
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p, ImVec2(p.x + box.x, p.y + box.y), col(0, 0, 0, 0.35f), 6.0f);
-    if (a.slide.tex && a.slide.w > 0 && s.slide) {
-        float k = std::min(box.x / a.slide.w, box.y / a.slide.h);
-        ImVec2 sz(a.slide.w * k, a.slide.h * k);
+    // an SLS slide, or else the service's 320x240 SPI logo
+    const LogoTextures *lt = s.selectedSid >= 0 ? findLogos(a, s.selectedSid) : nullptr;
+    const bool haveSlide = a.slide.tex && a.slide.w > 0 && s.slide;
+    const bool haveLogo = !haveSlide && lt && lt->logo320 && lt->largeW > 0;
+    if (haveSlide || haveLogo) {
+        const GLuint tex = haveSlide ? a.slide.tex : lt->logo320;
+        const float iw = (float)(haveSlide ? a.slide.w : lt->largeW), ih = (float)(haveSlide ? a.slide.h : lt->largeH);
+        float k = std::min(box.x / iw, box.y / ih);
+        ImVec2 sz(iw * k, ih * k);
         ImVec2 o(p.x + (box.x - sz.x) * 0.5f, p.y + (box.y - sz.y) * 0.5f);
-        dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)a.slide.tex), o, ImVec2(o.x + sz.x, o.y + sz.y),
+        dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)tex), o, ImVec2(o.x + sz.x, o.y + sz.y),
                             ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 6.0f);
     } else {
         const char *t = s.selectedSid >= 0 ? "No slideshow" : "";
@@ -532,7 +1031,9 @@ static void drawNowPlaying(App &a)
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), t);
     }
     ImGui::InvisibleButton("slide", box);
-    if (ImGui::IsItemHovered() && s.slide) {
+    if (ImGui::IsItemHovered() && haveLogo)
+        ImGui::SetTooltip("Station logo (SPI)\nShown until the station sends a slideshow image");
+    if (ImGui::IsItemHovered() && haveSlide) {
         const Slide &sl = *s.slide;
         std::string tip = sl.name.empty() ? "Slide" : sl.name;
         tip += "\n" + std::to_string(a.slide.w) + " x " + std::to_string(a.slide.h) + "  " + sl.ext + ", " +
@@ -637,6 +1138,7 @@ static void drawStatus(App &a)
     ImGui::PopStyleColor();
     ImGui::SameLine(ImGui::GetContentRegionMax().x - logW);
     if (ImGui::Button("Log")) ImGui::OpenPopup("Log");
+    handCursor();
     logPopup(a);
 }
 
@@ -647,6 +1149,8 @@ static void drawStatus(App &a)
 //   EDIPLAYER_SID=<hex>               play this service
 //   EDIPLAYER_SHOTS=<sec>:<file.png>,<sec>:<file.png>...   framebuffer captures
 //   EDIPLAYER_EXIT=<sec>              quit after <sec>
+//   EDIPLAYER_RECORD=<sec>            start raw + wav recording after <sec>
+//   EDIPLAYER_RATES=1                 keep the bitrate breakdown tooltip open
 
 static uint32_t crc32Png(const uint8_t *p, size_t n, uint32_t c = 0xFFFFFFFFu)
 {
@@ -704,7 +1208,7 @@ static void writePng(const char *path, int w, int h, const std::vector<uint8_t> 
 
 struct TestHooks {
     std::vector<std::pair<double, std::string>> shots;
-    double exitAt = -1;
+    double exitAt = -1, recordAt = -1;
     bool autostart = false;
     int sid = -1;
     void load(App &a)
@@ -718,6 +1222,8 @@ struct TestHooks {
             }
         }
         if (const char *e = getenv("EDIPLAYER_EXIT")) exitAt = atof(e);
+        if (const char *r = getenv("EDIPLAYER_RECORD")) recordAt = atof(r);
+        g_forceRateTooltip = getenv("EDIPLAYER_RATES") != nullptr;
         if (const char *u = getenv("EDIPLAYER_URL")) snprintf(a.url, sizeof(a.url), "%s", u);
         if (const char *s = getenv("EDIPLAYER_SID")) a.lastSid = (int)strtol(s, nullptr, 16);
         autostart = getenv("EDIPLAYER_AUTOSTART") != nullptr;
@@ -773,9 +1279,21 @@ static void applyTheme(float scale)
     s.FontScaleDpi = scale;
 }
 
+static ImFont *addFirstFont(const char *const *candidates, size_t n)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    for (size_t i = 0; i < n; i++) {
+        FILE *t = fopen(candidates[i], "rb");
+        if (!t) continue;
+        fclose(t);
+        if (ImFont *f = io.Fonts->AddFontFromFileTTF(candidates[i])) return f;
+    }
+    return nullptr;
+}
+
 static void loadFont()
 {
-    static const char *candidates[] = {
+    static const char *regular[] = {
 #ifdef _WIN32
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -788,13 +1306,22 @@ static void loadFont()
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
 #endif
     };
-    ImGuiIO &io = ImGui::GetIO();
-    for (const char *f : candidates) {
-        FILE *t = fopen(f, "rb");
-        if (!t) continue;
-        fclose(t);
-        if (io.Fonts->AddFontFromFileTTF(f)) break;
-    }
+    static const char *bold[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+#endif
+    };
+    // the first font added is the default
+    if (!addFirstFont(regular, sizeof(regular) / sizeof(regular[0]))) ImGui::GetIO().Fonts->AddFontDefault();
+    g_boldFont = addFirstFont(bold, sizeof(bold) / sizeof(bold[0]));
     ImGui::GetStyle().FontSizeBase = 16.0f;
 }
 
@@ -806,14 +1333,30 @@ int main(int, char **)
     a.settingsPath = settingsFile();
     loadSettings(a);
     a.audio.setVolume(a.volume);
+    a.player.setSpiBaseDir(spiBaseDir());
+    a.player.setRecordBaseDir(spiBaseDir());   // EDIplayer_audio/ next to EDIplayer_SPI/
 
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     const float scale = ImGui_ImplGlfw_GetContentScaleForMonitor(glfwGetPrimaryMonitor());
-    GLFWwindow *win = glfwCreateWindow((int)(940 * scale), (int)(600 * scale), "EDIplayer", nullptr, nullptr);
+    GLFWwindow *win = glfwCreateWindow((int)(940 * scale), (int)(610 * scale), "EDIplayer", nullptr, nullptr);
     if (!win) return 1;
     glfwSetWindowSizeLimits(win, (int)(720 * scale), (int)(520 * scale), GLFW_DONT_CARE, GLFW_DONT_CARE);
+#ifndef _WIN32
+    // window icon (on Windows it comes from the GLFW_ICON resource)
+    {
+        std::vector<GLFWimage> icons;
+        for (const auto &ic : kIconPngs) {
+            GLFWimage im;
+            int n;
+            im.pixels = stbi_load_from_memory(ic.data, (int)ic.size, &im.width, &im.height, &n, 4);
+            if (im.pixels) icons.push_back(im);
+        }
+        if (!icons.empty()) glfwSetWindowIcon(win, (int)icons.size(), icons.data());
+        for (auto &im : icons) stbi_image_free(im.pixels);
+    }
+#endif
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
 
@@ -833,6 +1376,12 @@ int main(int, char **)
 
     while (!glfwWindowShouldClose(win)) {
         if (th.exitAt >= 0 && now() - t0 >= th.exitAt) glfwSetWindowShouldClose(win, GLFW_TRUE);
+        if (th.recordAt >= 0 && now() - t0 >= th.recordAt) {
+            std::string err;
+            a.player.startRecording(Recorder::Raw, err);
+            a.player.startRecording(Recorder::Wav, err);
+            th.recordAt = -1;
+        }
 
         // ~20 fps while playing (level meter, label updates), slower when idle
         glfwWaitEventsTimeout(a.player.running() ? 0.05 : 0.25);

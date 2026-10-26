@@ -71,8 +71,8 @@ static void mot_feed(pad_ctx_t *ctx, bool start, const uint8_t *d, size_t len)
     }
 }
 
-void pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
-                 bool exact_xpad_len, const uint8_t *fpad)
+size_t pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
+                   bool exact_xpad_len, const uint8_t *fpad)
 {
     pad_ctx_t *ctx = opaque;
     (void)exact_xpad_len;  /* CI list delimits the X-PAD in both cases */
@@ -91,7 +91,7 @@ void pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
     ctx->last_app = -1;
 
     if (fpad_type != 0 || (xpad_ind != 1 && xpad_ind != 2))
-        return;
+        return 0;
 
     /* X-PAD is transmitted in reverse byte order */
     uint8_t xpad[PAD_MAX_XPAD];
@@ -106,7 +106,7 @@ void pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
     if (ci_flag) {
         if (xpad_ind == 1) {
             /* Short X-PAD: 1 CI byte + 3 data bytes */
-            if (xpad_len < 1) return;
+            if (xpad_len < 1) return 0;
             int app = xpad[0] & 0x1F;
             ci_len = 1;
             if (app != 0)
@@ -114,7 +114,7 @@ void pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
         } else {
             /* Variable size X-PAD: up to 4 CIs, end marker app type 0 */
             for (int i = 0; i < 4; i++) {
-                if (xpad_len < (size_t)i + 1) return;
+                if (xpad_len < (size_t)i + 1) return 0;
                 uint8_t ci = xpad[i];
                 ci_len++;
                 if ((ci & 0x1F) == 0) break;
@@ -127,7 +127,7 @@ void pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
     }
 
     if (n_sub == 0)
-        return;
+        return xpad_ind == 1 ? 4 : ci_len;
 
     size_t off = ci_len;
     int    last_app = -1;
@@ -162,4 +162,5 @@ void pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
         ctx->last_app = last_app;
         ctx->last_len = off;  /* total X-PAD length incl. CI list */
     }
+    return xpad_ind == 1 ? 4 : off;   /* short X-PAD is always 4 bytes */
 }
