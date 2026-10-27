@@ -17,7 +17,11 @@ Runs on Windows and Linux (Dear ImGui + GLFW + OpenGL 3, miniaudio for sound).
 
    Plain AF packets and PFT-fragmented (PF) packets are both accepted. The arrow next to the address opens the recent sources.
 2. The services appear on the left once the FIC has been received. Click one to play it. The ensemble header shows the EId and ECC, and the country's flag on the right. The country comes from the ECC plus the first hex digit of the EId (ETSI TS 101 756), and the European area and Australia are covered.
-3. On the right are the slideshow (320×240), the dynamic label and any DL Plus items (title, artist, ...). Hover the slide for its name and click-through URL.
+3. On the right are the slideshow (320×240), the dynamic label and any DL Plus items (title, artist, ...). Hover the slide for its name and click-through URL. Right-click it to copy the image to the clipboard. On Linux this needs `xclip` (X11) or `wl-copy` (Wayland).
+
+Hovering a service in the list shows its details, including its own ECC and country. Services from abroad often carry an ECC that differs from the ensemble's (FIG 0/9 extended field).
+
+**Announcements.** If the playing service takes part in announcements (FIG 0/18, e.g. road traffic), a small pill next to its programme type names the types it supports. While an announcement is signalled for it (FIG 0/19), the pill turns green and shows the active type. EDIplayer only shows this; it doesn't switch to the announcement's sub-channel.
 
 ### Recording
 
@@ -59,6 +63,13 @@ cmake --build build-linux -j
 ```
 
 This builds `EDIplayer` and `edi-probe`.
+
+**GitHub Actions** (`.github/workflows/build.yml`) builds both platforms on every push, and the builds can be downloaded from the run's page. Pushing a version tag also publishes them as a release:
+
+```
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 ### edi-probe
 

@@ -33,6 +33,13 @@
 #define STBI_ONLY_GIF
 #define STBI_ONLY_BMP
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"   // PNG for copying images to the clipboard
+
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>   // HWND for the clipboard
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -90,6 +97,9 @@ struct App {
     LogoTextures ensembleLogo;                  // logo32 / smallSrc only
     std::map<std::string, FlagTexture> flags;   // by ISO code
     std::string message;               // last start error
+    std::string toast;                 // short-lived status message
+    double toastTime = -100;
+    GLFWwindow *window = nullptr;
     std::deque<std::string> log;
     size_t logCounter = 0;
     uint64_t lastBytes = 0;
@@ -350,10 +360,104 @@ static const FlagTexture *flagTexture(App &a, const char *iso)
     return f.tex ? &f : nullptr;
 }
 
+// Put an image (JPEG/PNG/GIF/BMP file contents) on the system clipboard.
+// Windows: as a DIB (understood by every application) plus "PNG" (lossless,
+// keeps transparency). Linux: as image/png through wl-copy or xclip.
+static bool copyImageToClipboard(App &a, const std::vector<uint8_t> &file, std::string &err)
+{
+    int w, h, n;
+    unsigned char *px = stbi_load_from_memory(file.data(), (int)file.size(), &w, &h, &n, 4);
+    if (!px) {
+        err = "cannot decode the image";
+        return false;
+    }
+    std::vector<uint8_t> png;
+    if (file.size() > 8 && file[0] == 0x89 && file[1] == 'P' && file[2] == 'N' && file[3] == 'G') {
+        png = file;
+    } else {
+        stbi_write_png_to_func([](void *ctx, void *data, int size) {
+            auto *v = (std::vector<uint8_t> *)ctx;
+            v->insert(v->end(), (uint8_t *)data, (uint8_t *)data + size);
+        }, &png, w, h, 4, px, w * 4);
+    }
+#ifdef _WIN32
+    // CF_DIB: BITMAPINFOHEADER + bottom-up BGRX rows; transparency composited onto white
+    const size_t pixBytes = (size_t)w * h * 4;
+    HGLOBAL dib = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixBytes);
+    HGLOBAL pngMem = GlobalAlloc(GMEM_MOVEABLE, png.size());
+    bool ok = dib && pngMem;
+    if (ok) {
+        auto *bi = (BITMAPINFOHEADER *)GlobalLock(dib);
+        memset(bi, 0, sizeof(*bi));
+        bi->biSize = sizeof(*bi);
+        bi->biWidth = w;
+        bi->biHeight = h;   // positive: bottom-up
+        bi->biPlanes = 1;
+        bi->biBitCount = 32;
+        bi->biCompression = BI_RGB;
+        uint8_t *dst = (uint8_t *)(bi + 1);
+        for (int y = 0; y < h; y++) {
+            const uint8_t *s = px + (size_t)(h - 1 - y) * w * 4;
+            uint8_t *d = dst + (size_t)y * w * 4;
+            for (int x = 0; x < w; x++, s += 4, d += 4) {
+                const int al = s[3];
+                d[0] = (uint8_t)((s[2] * al + 255 * (255 - al)) / 255);
+                d[1] = (uint8_t)((s[1] * al + 255 * (255 - al)) / 255);
+                d[2] = (uint8_t)((s[0] * al + 255 * (255 - al)) / 255);
+                d[3] = 255;
+            }
+        }
+        GlobalUnlock(dib);
+        memcpy(GlobalLock(pngMem), png.data(), png.size());
+        GlobalUnlock(pngMem);
+        ok = OpenClipboard(glfwGetWin32Window(a.window)) != 0;
+    }
+    if (ok) {
+        EmptyClipboard();
+        ok = SetClipboardData(CF_DIB, dib) != nullptr;   // the clipboard owns it now
+        if (ok) dib = nullptr;
+        if (SetClipboardData(RegisterClipboardFormatA("PNG"), pngMem)) pngMem = nullptr;
+        CloseClipboard();
+    }
+    if (dib) GlobalFree(dib);
+    if (pngMem) GlobalFree(pngMem);
+    stbi_image_free(px);
+    if (!ok) err = "the clipboard is not available";
+    return ok;
+#else
+    (void)a;
+    stbi_image_free(px);
+    const bool wayland = getenv("WAYLAND_DISPLAY") != nullptr;
+    FILE *p = popen(wayland ? "wl-copy --type image/png 2>/dev/null" : "xclip -selection clipboard -t image/png -i 2>/dev/null", "w");
+    bool ok = p && fwrite(png.data(), 1, png.size(), p) == png.size();
+    if (p && pclose(p) != 0) ok = false;
+    if (!ok) err = wayland ? "copying images needs wl-copy (package wl-clipboard)" : "copying images needs xclip";
+    return ok;
+#endif
+}
+
+static void showToast(App &a, const std::string &msg)
+{
+    a.toast = msg;
+    a.toastTime = now();
+}
+
 static const LogoTextures *findLogos(const App &a, int sid)
 {
     auto it = a.logos.find((uint16_t)sid);
     return it == a.logos.end() ? nullptr : &it->second;
+}
+
+// Copy what the slideshow area shows: the slide, or else the station's 320x240 logo
+static void copyShownImage(App &a)
+{
+    const LogoTextures *lt = a.snap.selectedSid >= 0 ? findLogos(a, a.snap.selectedSid) : nullptr;
+    const std::vector<uint8_t> *img = a.snap.slide ? &a.snap.slide->data
+                                      : lt && lt->largeSrc ? lt->largeSrc.get() : nullptr;
+    if (!img) return;
+    std::string err;
+    if (copyImageToClipboard(a, *img, err)) showToast(a, "Image copied to the clipboard");
+    else showToast(a, "Copy failed: " + err);
 }
 
 static void pollPlayer(App &a)
@@ -544,6 +648,58 @@ static void drawSourceBar(App &a)
     endPanel();
 }
 
+// "ROAD TRAFFIC, NEWS" style list of the announcement types in `flags`
+static std::string announcementList(uint16_t flags, bool upper)
+{
+    std::string s;
+    for (int b = 0; b < 16; b++) {
+        if (!(flags & (1 << b))) continue;
+        std::string n = Player::announcementName(b);
+        if (upper) for (auto &c : n) c = (char)toupper((unsigned char)c);
+        s += (s.empty() ? "" : ", ") + n;
+    }
+    return s;
+}
+
+static int g_forceServiceTip = -1;   // test hook EDIPLAYER_SERVICE_TIP
+
+// Service list tooltip: identity (with the service's own country), format, PTY, announcements
+static void drawServiceTooltip(App &a, const ServiceEntry &e, const std::string &name)
+{
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(name.c_str());
+
+    ImGui::Text("SId %04X", e.sid);
+    if (e.ecc >= 0) {
+        ImGui::SameLine(0, ImGui::GetFontSize());
+        ImGui::Text("ECC %02X", e.ecc);
+        // the country comes from the service's ECC and the first digit of its SId
+        if (const Country *c = dabCountry((uint8_t)e.ecc, e.sid)) {
+            if (const FlagTexture *f = flagTexture(a, c->iso)) {
+                const float h = ImGui::GetFontSize() * 0.9f;
+                ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetTextLineHeight() - h) * 0.5f);
+                ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)f->tex), ImVec2(h * f->w / f->h, h));
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(c->name);
+        }
+    }
+    ImGui::SameLine(0, ImGui::GetFontSize());
+    ImGui::Text("SubChId %d", e.scid);
+
+    ImGui::Text("%s, %d kbit/s%s%s", e.dabplus ? "DAB+ (HE-AAC)" : "DAB (MPEG Layer II)", e.kbps,
+                e.protection.empty() ? "" : ", ", e.protection.c_str());
+    ImGui::Text("Programme type: %s", e.pty > 0 ? Player::ptyName(e.pty) : e.pty == 0 ? "none" : "unknown");
+    if (e.asu) ImGui::Text("Announcements: %s", announcementList(e.asu, false).c_str());
+    if (e.announcing) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.85f, 0.45f, 1.0f));
+        ImGui::Text("Now: %s announcement", announcementList(e.announcing, false).c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndTooltip();
+}
+
 // "SPI  12 / 33" with a thin bar while the SPI carousel loads
 static void drawSpiProgress(App &a)
 {
@@ -714,12 +870,7 @@ static void drawServices(App &a, float width)
             drawPlayingBars(dl, ImVec2(p.x + w - padX - fs * 0.85f, p.y + (rowH - fs) * 0.5f), fs,
                             std::max(a.audio.peakLeft(), a.audio.peakRight()), s.audioOk && a.player.running(),
                             ImGui::GetColorU32(kAccent));
-        if (hov) {
-            ImGui::SetTooltip("%s\nSId %04X   SubChId %d\n%s, %d kbit/s%s%s\nProgramme type: %s", name.c_str(), e.sid,
-                              e.scid, e.dabplus ? "DAB+ (HE-AAC)" : "DAB (MPEG Layer II)", e.kbps,
-                              e.protection.empty() ? "" : ", ", e.protection.c_str(),
-                              e.pty > 0 ? Player::ptyName(e.pty) : e.pty == 0 ? "none" : "unknown");
-        }
+        if (hov || e.sid == g_forceServiceTip) drawServiceTooltip(a, e, name);
         ImGui::PopID();
     }
     ImGui::EndChild();
@@ -929,6 +1080,43 @@ static void drawRateTooltip(const PlayerSnapshot &s, const ServiceEntry *svc, Im
     ImGui::EndTooltip();
 }
 
+// Small pill for services with announcement support (FIG 0/18): plain while
+// idle, green while an announcement is signalled (FIG 0/19)
+static void drawAnnouncementPill(const ServiceEntry &e)
+{
+    const bool on = e.announcing != 0;
+    const PillMetrics m;
+    const float size = m.textSize * 0.9f;
+    std::string label = announcementList(on ? e.announcing : e.asu, true);
+    if (!on && std::count(label.begin(), label.end(), ',') >= 2) label = "ANNOUNCEMENTS";
+    const float tw = m.font->CalcTextSizeA(size, FLT_MAX, 0.0f, label.c_str()).x;
+    const float padX = size * 0.6f, h = size * 1.45f;
+    const ImVec2 p(ImGui::GetCursorScreenPos().x,
+                   ImGui::GetCursorScreenPos().y + (ImGui::GetTextLineHeight() * 0.85f - h) * 0.5f);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 q(p.x + tw + padX * 2, p.y + h);
+    if (on) {
+        // a gentle pulse so an active announcement is noticed
+        const float k = 0.85f + 0.15f * (float)sin(now() * 3.0);
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ImVec4(0.18f * k, 0.62f * k, 0.32f * k, 1.0f)), h * 0.5f);
+        dl->AddText(m.font, size, ImVec2(p.x + padX, p.y + (h - size) * 0.5f), col(1, 1, 1), label.c_str());
+    } else {
+        dl->AddRect(p, q, col(1, 1, 1, 0.18f), h * 0.5f, 0, std::max(1.0f, ImGui::GetStyle().FontScaleDpi));
+        dl->AddText(m.font, size, ImVec2(p.x + padX, p.y + (h - size) * 0.5f),
+                    ImGui::GetColorU32(ImGuiCol_TextDisabled), label.c_str());
+    }
+    ImGui::Dummy(ImVec2(q.x - p.x, ImGui::GetTextLineHeight() * 0.85f));
+    if (ImGui::IsItemHovered()) {
+        if (on)
+            ImGui::SetTooltip("%s announcement in progress (sub-channel %d)\nSupported: %s",
+                              announcementList(e.announcing, false).c_str(), e.announceSubch,
+                              announcementList(e.asu, false).c_str());
+        else
+            ImGui::SetTooltip("Announcements supported: %s\nLights up green while one is signalled",
+                              announcementList(e.asu, false).c_str());
+    }
+}
+
 static void drawNowPlaying(App &a)
 {
     beginPanel("now", ImVec2(0, 0));
@@ -956,6 +1144,10 @@ static void drawNowPlaying(App &a)
         ImGui::TextUnformatted(fitText(line, textW).c_str());
         ImGui::PopStyleColor();
         ImGui::PopFont();
+        if (svc->asu) {
+            ImGui::SameLine(0, ImGui::GetFontSize() * 0.6f);
+            drawAnnouncementPill(*svc);
+        }
     }
     // codec line: "<format>  -  <bitrate>  -  buffering"; the bitrate is its own
     // item with a live breakdown tooltip
@@ -1030,17 +1222,24 @@ static void drawNowPlaying(App &a)
         dl->AddText(ImVec2(p.x + (box.x - ts.x) * 0.5f, p.y + (box.y - ts.y) * 0.5f),
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), t);
     }
-    ImGui::InvisibleButton("slide", box);
-    if (ImGui::IsItemHovered() && haveLogo)
-        ImGui::SetTooltip("Station logo (SPI)\nShown until the station sends a slideshow image");
-    if (ImGui::IsItemHovered() && haveSlide) {
+    ImGui::InvisibleButton("slide", box, ImGuiButtonFlags_MouseButtonRight);
+    const bool showTip = ImGui::IsItemHovered() && !ImGui::IsPopupOpen("slidemenu");
+    if (showTip && haveLogo)
+        ImGui::SetTooltip("Station logo (SPI)\nShown until the station sends a slideshow image\nRight-click to copy");
+    if (showTip && haveSlide) {
         const Slide &sl = *s.slide;
         std::string tip = sl.name.empty() ? "Slide" : sl.name;
         tip += "\n" + std::to_string(a.slide.w) + " x " + std::to_string(a.slide.h) + "  " + sl.ext + ", " +
                std::to_string(sl.data.size() / 1024) + " kB";
         if (!sl.categoryTitle.empty()) tip += "\nCategory: " + sl.categoryTitle;
         if (!sl.clickUrl.empty()) tip += "\n" + sl.clickUrl;
+        tip += "\nRight-click to copy";
         ImGui::SetTooltip("%s", tip.c_str());
+    }
+    if ((haveSlide || haveLogo) && ImGui::BeginPopupContextItem("slidemenu")) {
+        if (ImGui::MenuItem("Copy image")) copyShownImage(a);
+        handCursor();
+        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
@@ -1112,7 +1311,9 @@ static void drawStatus(App &a)
     const PlayerSnapshot &s = a.snap;
     std::string t;
     char b[160];
-    if (!a.message.empty()) {
+    if (now() - a.toastTime < 3.0) {
+        t = a.toast;
+    } else if (!a.message.empty()) {
         t = a.message;
     } else if (a.player.running()) {
         if (!s.sourceError.empty() && s.sourceState != EdiSource::State::Receiving) {
@@ -1151,6 +1352,8 @@ static void drawStatus(App &a)
 //   EDIPLAYER_EXIT=<sec>              quit after <sec>
 //   EDIPLAYER_RECORD=<sec>            start raw + wav recording after <sec>
 //   EDIPLAYER_RATES=1                 keep the bitrate breakdown tooltip open
+//   EDIPLAYER_COPY=<sec>              copy the shown slide / logo to the clipboard after <sec>
+//   EDIPLAYER_SERVICE_TIP=<hex>       keep this service's list tooltip open
 
 static uint32_t crc32Png(const uint8_t *p, size_t n, uint32_t c = 0xFFFFFFFFu)
 {
@@ -1208,7 +1411,7 @@ static void writePng(const char *path, int w, int h, const std::vector<uint8_t> 
 
 struct TestHooks {
     std::vector<std::pair<double, std::string>> shots;
-    double exitAt = -1, recordAt = -1;
+    double exitAt = -1, recordAt = -1, copyAt = -1;
     bool autostart = false;
     int sid = -1;
     void load(App &a)
@@ -1224,6 +1427,8 @@ struct TestHooks {
         if (const char *e = getenv("EDIPLAYER_EXIT")) exitAt = atof(e);
         if (const char *r = getenv("EDIPLAYER_RECORD")) recordAt = atof(r);
         g_forceRateTooltip = getenv("EDIPLAYER_RATES") != nullptr;
+        if (const char *c = getenv("EDIPLAYER_COPY")) copyAt = atof(c);
+        if (const char *t = getenv("EDIPLAYER_SERVICE_TIP")) g_forceServiceTip = (int)strtol(t, nullptr, 16);
         if (const char *u = getenv("EDIPLAYER_URL")) snprintf(a.url, sizeof(a.url), "%s", u);
         if (const char *s = getenv("EDIPLAYER_SID")) a.lastSid = (int)strtol(s, nullptr, 16);
         autostart = getenv("EDIPLAYER_AUTOSTART") != nullptr;
@@ -1358,6 +1563,7 @@ int main(int, char **)
     }
 #endif
     glfwMakeContextCurrent(win);
+    a.window = win;
     glfwSwapInterval(1);
 
     IMGUI_CHECKVERSION();
@@ -1376,6 +1582,10 @@ int main(int, char **)
 
     while (!glfwWindowShouldClose(win)) {
         if (th.exitAt >= 0 && now() - t0 >= th.exitAt) glfwSetWindowShouldClose(win, GLFW_TRUE);
+        if (th.copyAt >= 0 && now() - t0 >= th.copyAt) {
+            copyShownImage(a);
+            th.copyAt = -1;
+        }
         if (th.recordAt >= 0 && now() - t0 >= th.recordAt) {
             std::string err;
             a.player.startRecording(Recorder::Raw, err);

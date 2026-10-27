@@ -1,0 +1,72 @@
+# Builds EDIplayer for Windows x64 and Linux x64 on every push and pull request.
+# Pushing a tag that starts with "v" (e.g. v1.0.0) also publishes both builds as a GitHub release.
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the release on tag pushes
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/EDIplayer | Out-Null
+          Copy-Item build/Release/EDIplayer.exe, build/Release/edi-probe.exe, README.md dist/EDIplayer/
+          Compress-Archive -Path dist/EDIplayer -DestinationPath EDIplayer-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EDIplayer-windows-x64
+          path: EDIplayer-windows-x64.zip
+
+  linux:
+    # The oldest supported runner, so the binary runs on older glibc versions too
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Package
+        run: |
+          mkdir -p dist/EDIplayer
+          cp build/EDIplayer build/edi-probe README.md dist/EDIplayer/
+          strip dist/EDIplayer/EDIplayer dist/EDIplayer/edi-probe
+          tar -czf EDIplayer-linux-x64.tar.gz -C dist EDIplayer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EDIplayer-linux-x64
+          path: EDIplayer-linux-x64.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            EDIplayer-windows-x64.zip
+            EDIplayer-linux-x64.tar.gz
+          generate_release_notes: true

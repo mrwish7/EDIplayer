@@ -36,6 +36,11 @@ struct ServiceEntry {
     bool dabplus = false;      // false: DAB (MP2)
     int pty = -1;              // international programme type (FIG 0/17), -1 unknown
     std::string protection;    // "EEP-3A", "UEP-3", empty if unknown
+    int ecc = -1;              // the service's ECC (own if signalled, else the ensemble's), -1 unknown
+    bool eccOwn = false;       // ECC signalled for this service (FIG 0/9 extended field)
+    uint16_t asu = 0;          // announcement types supported (FIG 0/18)
+    uint16_t announcing = 0;   // announcement types active now (FIG 0/19)
+    int announceSubch = -1;    // sub-channel carrying the active announcement
 };
 
 struct DlPlusItem {
@@ -129,6 +134,9 @@ public:
 
     // Programme type name (European / RDS table, ETSI TS 101 756 table 12)
     static const char *ptyName(int pty);
+
+    // Announcement type name for bit `bit` of the ASu/ASw flags (EN 300 401 table 14)
+    static const char *announcementName(int bit);
 
 private:
     struct Engine;

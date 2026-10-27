@@ -492,9 +492,11 @@ struct SiParser {
     // service being parsed
     std::vector<uint16_t> sids;
     std::vector<std::pair<std::string, std::array<int, 3>>> media;
-    // multimedia directly inside the ensemble (<services>) element: the ensemble logo
+    // multimedia inside the ensemble (<services>) element but outside any <service>
+    // (usually wrapped in <mediaDescription>): the ensemble logo
     std::vector<std::pair<std::string, std::array<int, 3>>> ensembleMedia;
     std::vector<std::pair<std::string, std::array<int, 3>>> *current = nullptr;   // multimedia being filled
+    int inService = 0, inEnsemble = 0;
 
     std::string str(const uint8_t *p, size_t n) const
     {
@@ -516,6 +518,8 @@ struct SiParser {
         size_t off = n >= 1 + 3 + sidLen ? 4 : 1;   // ECC + EId present?
         if (off + sidLen > n) return -1;
         if (longSid) return -1;                       // data service: no logo slot
+        if (p[0] & 0x0F) return -1;                   // SCIdS > 0: a secondary component of that
+                                                      // service, not the service itself
         return (p[off] << 8) | p[off + 1];
     }
 
@@ -567,11 +571,15 @@ struct SiParser {
             media.clear();
         }
         if (tag == TagMultimedia) {
-            current = parent == TagServices ? &ensembleMedia : &media;
+            current = inEnsemble && !inService ? &ensembleMedia : &media;
             current->push_back({std::string(), {0, 0, 0}});
         }
 
+        inService += tag == TagService;
+        inEnsemble += tag == TagServices;
         for (size_t i = 0; i < len;) i += element(v + i, len - i, tag);
+        inService -= tag == TagService;
+        inEnsemble -= tag == TagServices;
 
         if (tag == TagService)
             for (uint16_t sid : sids)

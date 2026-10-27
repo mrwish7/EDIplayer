@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <thread>
 
@@ -60,7 +61,7 @@ int main(int argc, char **argv)
         return 1;
     }
     std::string url = argv[1];
-    int sid = -1, seconds = 20, spiSeconds = 0;
+    int sid = -1, seconds = 20, spiSeconds = 0, annSeconds = 0;
     const char *wav = nullptr, *slides = nullptr, *spiDir = ".", *recordDir = nullptr;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--sid")) sid = (int)strtol(argv[i + 1], nullptr, 16);
@@ -70,6 +71,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--spi")) spiSeconds = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--spi-dir")) spiDir = argv[i + 1];
         else if (!strcmp(argv[i], "--record")) recordDir = argv[i + 1];
+        else if (!strcmp(argv[i], "--announcements")) annSeconds = atoi(argv[i + 1]);
     }
 
     WavSink sink;
@@ -91,8 +93,29 @@ int main(int argc, char **argv)
     }
     printf("Ensemble 0x%04X \"%s\"  (%llu frames)\n", s.eid, s.ensemble.c_str(), (unsigned long long)s.afFrames);
     for (const auto &e : s.services)
-        printf("  SId %04X  SCID %2d  %-5s %3d kbit/s  %-7s %-16s \"%s\"\n", e.sid, e.scid, e.dabplus ? "DAB+" : "DAB",
-               e.kbps, e.protection.c_str(), e.pty >= 0 ? Player::ptyName(e.pty) : "?", e.label.c_str());
+        printf("  SId %04X  SCID %2d  %-5s %3d kbit/s  %-7s %-16s ECC %02X%s  ASu %04X  \"%s\"\n", e.sid, e.scid,
+               e.dabplus ? "DAB+" : "DAB", e.kbps, e.protection.c_str(), e.pty >= 0 ? Player::ptyName(e.pty) : "?",
+               e.ecc & 0xFF, e.eccOwn ? "*" : " ", e.asu, e.label.c_str());
+
+    if (annSeconds > 0) {   // report announcements switching on and off
+        std::map<uint16_t, uint16_t> last;
+        auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(annSeconds)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            s = player.snapshot();
+            for (const auto &e : s.services) {
+                if (last[e.sid] == e.announcing) continue;
+                last[e.sid] = e.announcing;
+                std::string types;
+                for (int b = 0; b < 16; b++)
+                    if (e.announcing & (1 << b)) types += std::string(types.empty() ? "" : ", ") + Player::announcementName(b);
+                printf("%6.1f s  %-20s %s%s\n",
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), e.label.c_str(),
+                       e.announcing ? "ANNOUNCEMENT " : "ended", types.c_str());
+                fflush(stdout);
+            }
+        }
+    }
 
     if (spiSeconds > 0) {
         auto t0 = std::chrono::steady_clock::now();

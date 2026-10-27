@@ -250,6 +250,10 @@ void Player::Engine::updateServiceList()
         e.kbps = mstSize[sv.scid] / 3;                           // bytes per 24 ms -> kbit/s
         e.dabplus = sv.ascty == ASCTY_DABPLUS;
         e.pty = sv.has_pty ? sv.pty : -1;
+        e.eccOwn = sv.has_ecc;
+        e.ecc = sv.has_ecc ? sv.ecc : fic.has_ecc ? fic.ecc : -1;
+        e.asu = sv.asu;
+        e.announcing = fic_active_announcements(&fic, &sv, &e.announceSubch);
         const fic_subch_t &sc = fic.subch[sv.scid];
         if (sc.valid) {
             char prot[16];
@@ -273,7 +277,8 @@ void Player::Engine::updateServiceList()
     std::string state = fic.has_ens_label ? fic.ens_label : "";
     for (const auto &e : list)
         state += "|" + std::to_string(e.sid) + ":" + e.label + ":" + std::to_string(e.kbps) + std::to_string(e.dabplus) +
-                 ":" + std::to_string(e.pty) + e.protection;
+                 ":" + std::to_string(e.pty) + e.protection + ":" + std::to_string(e.ecc) + ":" +
+                 std::to_string(e.asu) + ":" + std::to_string(e.announcing);
     if (state == listKey) return;
     listKey = state;
 
@@ -509,6 +514,15 @@ const char *Player::ptyName(int pty)
         "", "",
     };
     return pty >= 0 && pty < 32 ? names[pty] : "";
+}
+
+const char *Player::announcementName(int bit)
+{
+    static const char *const names[11] = {
+        "Alarm", "Road traffic", "Transport", "Warning/service", "News", "Weather",
+        "Event", "Special event", "Programme info", "Sport", "Financial",
+    };
+    return bit >= 0 && bit < 11 ? names[bit] : "Announcement";
 }
 
 const char *Player::dlPlusTypeName(int type)

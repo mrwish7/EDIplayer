@@ -37,7 +37,19 @@ typedef struct {
     bool     has_label;
     uint8_t  pty;                    /* international programme type, FIG 0/17 */
     bool     has_pty;
+    uint8_t  ecc;                    /* service ECC if it differs from the ensemble's (FIG 0/9 ext.) */
+    bool     has_ecc;
+    uint16_t asu;                    /* announcement support flags, FIG 0/18 */
+    uint8_t  clusters[8];            /* announcement clusters it belongs to */
+    uint8_t  n_clusters;
 } svc_info_t;
+
+/* Announcement switching in a cluster, FIG 0/19 */
+typedef struct {
+    uint16_t asw;        /* active announcement types (0 = none) */
+    uint8_t  subch;      /* sub-channel carrying the announcement */
+    uint32_t seen;       /* fic_state_t.fic_count when last signalled */
+} fic_cluster_t;
 
 /* Sub-channel protection, FIG 0/1 */
 typedef struct {
@@ -95,6 +107,8 @@ typedef struct {
     uint8_t    ecc;                      /* Extended Country Code, FIG 0/9 */
     bool       has_ecc;
     fic_subch_t subch[64];               /* by SubChId */
+    fic_cluster_t clusters[256];         /* announcement switching, by cluster id */
+    uint32_t   fic_count;                /* fic_parse() calls (one per 24 ms frame) */
 
     fic_packet_comp_t    packet[FIC_MAX_COMPS];
     int                  n_packet;
@@ -127,6 +141,10 @@ void fic_parse(fic_state_t *s, const uint8_t *fic, uint16_t fic_len);
  * has been seen. n_streams is the
  * number of EST streams seen so we know when coverage is sufficient. */
 bool fic_complete(const fic_state_t *s, int n_streams);
+
+/* Announcement types active for a service now (ASw & ASu over its clusters,
+ * signalled within the last ~2 s), and the sub-channel carrying it. */
+uint16_t fic_active_announcements(const fic_state_t *s, const svc_info_t *sv, int *subch);
 
 /* Look up a service by SCID. Returns NULL if not found. */
 const svc_info_t *fic_find_by_scid(const fic_state_t *s, uint8_t scid);

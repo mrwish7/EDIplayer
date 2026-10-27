@@ -332,6 +332,78 @@ static void parse_fig0_9(fic_state_t *s, const uint8_t *d, int len)
     if (len < 2) return;
     s->ecc     = d[1];
     s->has_ecc = true;
+
+    /* Extended field (Ext flag): services whose ECC differs from the
+     * ensemble's, in sub-fields of
+     *   Number of services (2) | rfa (6) | ECC (8) | SId (16) x n */
+    if (!(d[0] & 0x80) || len < 3) return;
+    int i = 3;   /* after the International Table Id */
+    while (i + 2 <= len) {
+        int     n   = d[i] >> 6;
+        uint8_t ecc = d[i + 1];
+        i += 2;
+        for (int k = 0; k < n && i + 2 <= len; k++, i += 2) {
+            svc_info_t *sv = find_or_add(s, (uint16_t)((d[i] << 8) | d[i + 1]));
+            if (sv) {
+                sv->ecc     = ecc;
+                sv->has_ecc = true;
+            }
+        }
+    }
+}
+
+/*
+ * FIG 0/18 — Announcement support. ETSI EN 300 401 §8.1.6.1.
+ *   SId (16) | ASu flags (16) | rfa (3) | Number of clusters (5) | Cluster Id (8) x n
+ */
+static void parse_fig0_18(fic_state_t *s, const uint8_t *d, int len)
+{
+    int i = 0;
+    while (i + 5 <= len) {
+        uint16_t sid = (uint16_t)((d[i] << 8) | d[i + 1]);
+        uint16_t asu = (uint16_t)((d[i + 2] << 8) | d[i + 3]);
+        int      n   = d[i + 4] & 0x1F;
+        i += 5;
+        svc_info_t *sv = find_or_add(s, sid);
+        if (sv) {
+            sv->asu = asu;
+            sv->n_clusters = 0;
+        }
+        for (int k = 0; k < n && i < len; k++, i++)
+            if (sv && sv->n_clusters < sizeof(sv->clusters))
+                sv->clusters[sv->n_clusters++] = d[i];
+    }
+}
+
+/*
+ * FIG 0/19 — Announcement switching. ETSI EN 300 401 §8.1.6.2.
+ *   Cluster Id (8) | ASw flags (16) | New flag (1) | Region flag (1) | SubChId (6)
+ *   [rfa (2) | Region Id lower part (6) if Region flag]
+ */
+static void parse_fig0_19(fic_state_t *s, const uint8_t *d, int len)
+{
+    int i = 0;
+    while (i + 4 <= len) {
+        fic_cluster_t *c = &s->clusters[d[i]];
+        c->asw   = (uint16_t)((d[i + 1] << 8) | d[i + 2]);
+        c->subch = d[i + 3] & 0x3F;
+        c->seen  = s->fic_count;
+        i += 4 + ((d[i + 3] & 0x40) ? 1 : 0);
+    }
+}
+
+uint16_t fic_active_announcements(const fic_state_t *s, const svc_info_t *sv, int *subch)
+{
+    uint16_t active = 0;
+    for (int k = 0; k < sv->n_clusters; k++) {
+        const fic_cluster_t *c = &s->clusters[sv->clusters[k]];
+        /* FIG 0/19 repeats about every second while an announcement runs */
+        if (!c->asw || s->fic_count - c->seen > 84) continue;
+        uint16_t a = c->asw & sv->asu;
+        if (a && !active && subch) *subch = c->subch;
+        active |= a;
+    }
+    return active;
 }
 
 /*
@@ -475,6 +547,8 @@ static void parse_fib(fic_state_t *s, const uint8_t *fib)
             case 1:  if (!cn) parse_fig0_1(s, fd, fl); break;   /* current configuration only */
             case 2:  parse_fig0_2(s, fd, fl, pd);  break;
             case 17: if (!pd) parse_fig0_17(s, fd, fl); break;
+            case 18: if (!pd) parse_fig0_18(s, fd, fl); break;
+            case 19: parse_fig0_19(s, fd, fl); break;
             case 3:  parse_fig0_3(s, fd, fl);      break;
             case 8:  parse_fig0_8(s, fd, fl, pd);  break;
             case 9:  parse_fig0_9(s, fd, fl);      break;
@@ -496,6 +570,7 @@ static void parse_fib(fic_state_t *s, const uint8_t *fib)
 
 void fic_parse(fic_state_t *s, const uint8_t *fic, uint16_t fic_len)
 {
+    s->fic_count++;
     for (uint16_t off = 0; off + FIB_TOTAL <= fic_len; off += FIB_TOTAL)
         parse_fib(s, fic + off);
 }
