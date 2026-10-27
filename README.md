@@ -46,6 +46,8 @@ If the multiplex carries SPI (Service and Programme Information, ETSI TS 102 818
 - The **320×240 logo** fills the slideshow area until the station sends a slideshow image of its own.
 - A small **SPI** line under the ensemble name shows the carousel loading (`SPI 12 / 33`). Carousels are slow, so a full load can take several minutes.
 
+- If the SPI carries **programme information**, a small **EPG** button appears on that line. It opens the programme guide: the stations one above the other and their programmes running across the day, with a line at the current time and what's on now highlighted. Hover a programme for its description; click a station to play it; the arrows change the day. Times are shown in your computer's time zone. Schedules that ended more than a day ago are left out (some broadcasters keep sending old ones).
+
 All received files are saved to `EDIplayer_SPI/<ECC><EId>/` next to the program, e.g. `EDIplayer_SPI/E1CFCB/`. On Linux, if that folder isn't writable, they go under `~/.config/ediplayer/` instead. The folder also holds `logos.txt`, which records which logo belongs to which service, so the next time you connect to that ensemble the logos appear straight away.
 
 The source, volume, last service and recent sources are saved (`EDIplayer.ini` next to the exe on Windows, `~/.config/ediplayer/settings.ini` on Linux). On the next start the last service resumes automatically. **Log** shows what the receiver and decoders report.
@@ -141,7 +143,7 @@ From there:
 - **DAB+ Reed-Solomon** isn't applied (EDI is normally error-free). AUs failing their CRC are replaced by silence.
 - **MP2 at 24 kHz** (half sample rate) isn't detected, only 48 kHz.
 - **Slideshow in MOT directory mode** and packet-mode data services aren't supported. Only audio services are listed.
-- **SPI:** programme information (EPG schedules) is saved but not shown yet. The SI file is saved in its binary broadcast form, not as XML. gzip-compressed SI objects and compressed MOT directories aren't decoded. SPI carried in a service's X-PAD isn't decoded, only packet-mode SPI.
+- **SPI:** the programme guide shows programmes, not programme groups or the parts of a programme (programme events). The SI file is saved in its binary broadcast form, not as XML. gzip-compressed SI objects and compressed MOT directories aren't decoded. SPI carried in a service's X-PAD isn't decoded, only packet-mode SPI.
 - Some stations rotate their service label. The list shows the latest label but keeps the position of the first one seen, so rows don't jump.
 
 ## Licences

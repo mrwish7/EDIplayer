@@ -120,6 +120,7 @@ struct PlayerSnapshot {
     SharedBytes ensembleLogo;              // 32x32 (or nearest square), if the SI has one
     SpiProgress spi;
     std::string spiFolder;
+    std::shared_ptr<const EpgSchedule> epg;   // programme information from SPI, if any
 
     // recordings of the playing service: [Recorder::Raw], [Recorder::Wav]
     Recorder::State rec[2];

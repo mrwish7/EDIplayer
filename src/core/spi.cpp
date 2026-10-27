@@ -9,6 +9,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -400,6 +401,8 @@ SpiProgress SpiDecoder::progress() const
 // ---------------------------------------------------------------------------
 // Objects
 
+static std::string safePath(const std::string &name);
+
 void SpiDecoder::onObject(const std::string &name, int ctype, int csub, bool compressed, const Bytes &body)
 {
     saveFile(name, body);
@@ -413,6 +416,9 @@ void SpiDecoder::onObject(const std::string &name, int ctype, int csub, bool com
             parseServiceInformation(body);
             resolveLogos();
         }
+    } else if (ctype == 7 && csub == 1) {   // SPI Programme Information
+        if (compressed) edi_log("SPI: %s is compressed - not supported", name.c_str());
+        else parseProgrammeInformation(safePath(name), body);
     }
 }
 
@@ -473,6 +479,7 @@ void SpiDecoder::setEnsemble(uint8_t ecc, uint16_t eid)
     for (auto &p : pendingSave_) saveFile(p.first, p.second);
     pendingSave_.clear();
     loadIndex();
+    loadSavedProgrammeInformation();
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +595,201 @@ struct SiParser {
         return hdr + len;
     }
 };
+
+// Binary encoded Programme Information:
+//   <epg> <schedule> <scope> <serviceScope id=bearer/> </scope>
+//     <programme> <shortName/mediumName/longName> CDATA
+//       <location> <time time= duration=/> <bearer id=/> </location>
+//       <mediaDescription> <shortDescription> CDATA </mediaDescription>
+enum : uint8_t {
+    TagEpg = 0x02, TagDefaultContentId = 0x05, TagShortName = 0x10, TagMediumName = 0x11, TagLongName = 0x12, TagMediaDescription = 0x13,
+    TagLocation = 0x19, TagShortDescription = 0x1A, TagLongDescription = 0x1B, TagProgramme = 0x1C,
+    TagServiceScope = 0x25, TagTime = 0x2C, TagProgrammeEvent = 0x2E,
+    AttrTime = 0x80, AttrDuration = 0x81,
+};
+
+// Time point (TS 102 371 §4.7.4), as AbracaDABra decodes it: rfu (1) | MJD (17) | LSI (1) |
+// LTO flag (bit 12) | UTC flag (bit 11) | hours (5) | minutes (6) | [seconds (6) | ms (10)] | [LTO (8)].
+// The time is UTC; the LTO only says how it was meant to be shown.
+static int64_t spiTime(const uint8_t *p, size_t n)
+{
+    if (n < 4) return -1;
+    const uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    const int64_t mjd = (v >> 14) & 0x1FFFF;
+    const int h = (v >> 6) & 0x1F, m = v & 0x3F;
+    const int s = (v & (1 << 11)) && n >= 6 ? p[4] >> 2 : 0;
+    return (mjd - 40587) * 86400 + h * 3600 + m * 60 + s;   // MJD 40587 = 1970-01-01
+}
+
+struct PiParser {
+    std::map<uint8_t, std::string> tokens;
+    std::vector<uint8_t> stack;               // open elements
+    std::vector<uint16_t> scopeSids;          // <scope><serviceScope>
+    std::vector<uint16_t> defaultSids;        // <defaultContentId>
+    struct Prog {
+        EpgProgramme p;
+        std::vector<std::pair<int64_t, int>> times;
+        std::vector<uint16_t> sids;
+    };
+    std::vector<Prog> progs;
+    int cur = -1;                             // programme being parsed
+
+    std::string str(const uint8_t *p, size_t n) const
+    {
+        std::string s;
+        for (size_t i = 0; i < n; i++) {
+            auto t = tokens.find(p[i]);
+            if (p[i] < 0x20 && t != tokens.end()) s += t->second;
+            else s += (char)p[i];
+        }
+        return s;
+    }
+
+    bool inProgramme() const { return cur >= 0; }
+
+    size_t element(const uint8_t *p, size_t max)
+    {
+        if (max < 2) return max;
+        uint8_t tag = p[0];
+        size_t len = p[1], hdr = 2;
+        if (len == 0xFE) {
+            if (max < 4) return max;
+            len = ((size_t)p[2] << 8) | p[3];
+            hdr = 4;
+        } else if (len == 0xFF) {
+            if (max < 5) return max;
+            len = ((size_t)p[2] << 16) | ((size_t)p[3] << 8) | p[4];
+            hdr = 5;
+        }
+        if (hdr + len > max) return max;
+        const uint8_t *v = p + hdr;
+        const uint8_t parent = stack.empty() ? 0 : stack.back();
+
+        if (tag >= 0x80) {   // attribute of `parent`
+            if (parent == TagTime && inProgramme() && !progs[cur].times.empty()) {
+                auto &t = progs[cur].times.back();
+                if (tag == AttrTime) t.first = spiTime(v, len);
+                else if (tag == AttrDuration && len >= 2) t.second = (v[0] << 8) | v[1];
+            } else if (parent == TagBearer && tag == AttrBearerId && inProgramme()) {
+                int sid = SiParser::bearerSid(v, len);
+                if (sid >= 0) progs[cur].sids.push_back((uint16_t)sid);
+            } else if (parent == TagServiceScope && tag == 0x80) {
+                int sid = SiParser::bearerSid(v, len);
+                if (sid >= 0) scopeSids.push_back((uint16_t)sid);
+            }
+            return hdr + len;
+        }
+        if (tag == TagTokenTable) {
+            for (size_t i = 0; i + 2 <= len;) {
+                uint8_t id = v[i], tl = v[i + 1];
+                if (i + 2 + tl > len) break;
+                tokens[id] = std::string((const char *)v + i + 2, tl);
+                i += 2 + tl;
+            }
+            return hdr + len;
+        }
+        if (tag == TagCdata) {
+            // text of the element that contains it, for the programme's own names and description
+            const size_t n = stack.size();
+            if (inProgramme() && n >= 2) {
+                EpgProgramme &pr = progs[cur].p;
+                const uint8_t up = stack[n - 2];
+                if (up == TagProgramme) {
+                    if (parent == TagShortName) pr.shortName = str(v, len);
+                    else if (parent == TagMediumName) pr.mediumName = str(v, len);
+                    else if (parent == TagLongName) pr.longName = str(v, len);
+                } else if (up == TagMediaDescription && n >= 3 && stack[n - 3] == TagProgramme) {
+                    if (parent == TagShortDescription && pr.description.empty()) pr.description = str(v, len);
+                    else if (parent == TagLongDescription) pr.description = str(v, len);
+                }
+            }
+            return hdr + len;
+        }
+        if (tag == TagDefaultContentId) {   // the service of the whole document, as a bearer URI
+            int sid = SiParser::bearerSid(v, len);
+            if (sid >= 0) defaultSids.push_back((uint16_t)sid);
+            return hdr + len;
+        }
+        if (tag == TagProgrammeEvent) return hdr + len;   // parts of a programme: not shown
+
+        const bool startsProgramme = tag == TagProgramme && !inProgramme();
+        if (startsProgramme) {
+            progs.push_back(Prog());
+            cur = (int)progs.size() - 1;
+        }
+        if (tag == TagTime && inProgramme() && parent == TagLocation) progs[cur].times.push_back({-1, 0});
+
+        stack.push_back(tag);
+        for (size_t i = 0; i < len;) i += element(v + i, len - i);
+        stack.pop_back();
+        if (startsProgramme) cur = -1;
+        return hdr + len;
+    }
+};
 }   // namespace
+
+void SpiDecoder::parseProgrammeInformation(const std::string &name, const Bytes &body)
+{
+    PiParser p;
+    for (size_t i = 0; i < body.size();) i += p.element(body.data() + i, body.size() - i);
+    auto &list = piFiles_[name];
+    list.clear();
+    for (const auto &pr : p.progs) {
+        // the service: the programme's own bearer, else the schedule's scope, else the document's default
+        const std::vector<uint16_t> &sids = !pr.sids.empty() ? pr.sids : !p.scopeSids.empty() ? p.scopeSids : p.defaultSids;
+        for (const auto &t : pr.times) {
+            if (t.first < 0) continue;
+            EpgProgramme e = pr.p;
+            e.start = t.first;
+            e.duration = t.second;
+            for (uint16_t sid : sids)
+                if (std::none_of(list.begin(), list.end(), [&](const std::pair<uint16_t, EpgProgramme> &x) {
+                        return x.first == sid && x.second.start == e.start;
+                    }))
+                    list.push_back({sid, e});
+        }
+    }
+    edi_log("SPI: programme information %s: %zu programmes", name.c_str(), list.size());
+    epgChanged_ = true;
+}
+
+// PI files from earlier sessions (binary PI starts with the <epg> tag)
+void SpiDecoder::loadSavedProgrammeInformation()
+{
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(fs::u8path(folder_), ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::ifstream f(it->path(), std::ios::binary);
+        if (f.peek() != TagEpg) continue;
+        Bytes b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::string name = pathStr(fs::relative(it->path(), fs::u8path(folder_), ec));
+        std::replace(name.begin(), name.end(), '\\', '/');   // as safePath() names it
+        if (!piFiles_.count(name)) parseProgrammeInformation(name, b);
+    }
+}
+
+bool SpiDecoder::takeEpg(std::shared_ptr<const EpgSchedule> &out)
+{
+    if (!epgChanged_) return false;
+    epgChanged_ = false;
+    // leave out programmes that ended more than a day ago (old PI files saved by earlier sessions)
+    const int64_t oldest = (int64_t)time(nullptr) - 86400;
+    auto epg = std::make_shared<EpgSchedule>();
+    for (const auto &f : piFiles_)
+        for (const auto &p : f.second)
+            if (p.second.start + p.second.duration >= oldest) (*epg)[p.first].push_back(p.second);
+    for (auto &s : *epg) {
+        auto &v = s.second;
+        std::sort(v.begin(), v.end(), [](const EpgProgramme &a, const EpgProgramme &b) { return a.start < b.start; });
+        v.erase(std::unique(v.begin(), v.end(), [](const EpgProgramme &a, const EpgProgramme &b) { return a.start == b.start; }),
+                v.end());
+        // no duration signalled: until the next programme
+        for (size_t i = 0; i < v.size(); i++)
+            if (!v[i].duration && i + 1 < v.size()) v[i].duration = (int)(v[i + 1].start - v[i].start);
+    }
+    out = epg;
+    return true;
+}
 
 void SpiDecoder::parseServiceInformation(const Bytes &body)
 {

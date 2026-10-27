@@ -723,6 +723,29 @@ static void drawServiceTooltip(App &a, const ServiceEntry &e, const std::string 
     ImGui::EndTooltip();
 }
 
+static bool g_openEpg = false;   // set by the EPG button, opened at the main window level
+
+// Small "EPG" pill that opens the programme guide
+static bool epgButton()
+{
+    ImFont *f = g_boldFont ? g_boldFont : ImGui::GetFont();
+    const float ts = ImGui::GetFontSize() * 0.72f;
+    const ImVec2 tsz = f->CalcTextSizeA(ts, FLT_MAX, 0, "EPG");
+    const float padX = ts * 0.55f, h = ts * 1.45f, lineH = ImGui::GetTextLineHeight();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    p.y += (lineH - h) * 0.5f;
+    ImGui::SetCursorScreenPos(p);
+    const bool pressed = ImGui::InvisibleButton("##epg", ImVec2(tsz.x + padX * 2, h));
+    handCursor();
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 q(p.x + tsz.x + padX * 2, p.y + h);
+    dl->AddRectFilled(p, q, ImGui::GetColorU32(ImVec4(kAccent.x, kAccent.y, kAccent.z, hov ? 1.0f : 0.8f)), h * 0.3f);
+    dl->AddText(f, ts, ImVec2(p.x + padX, p.y + (h - tsz.y) * 0.5f), IM_COL32_WHITE, "EPG");
+    if (hov) ImGui::SetTooltip("Programme guide");
+    return pressed;
+}
+
 // "SPI  12 / 33" with a thin bar while the SPI carousel loads
 static void drawSpiProgress(App &a)
 {
@@ -739,8 +762,12 @@ static void drawSpiProgress(App &a)
     ImGui::TextUnformatted(txt);
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Service and Programme Information: station logos.\nFiles are saved to\n%s",
+        ImGui::SetTooltip("Service and Programme Information: station logos and programme guide.\nFiles are saved to\n%s",
                           a.snap.spiFolder.empty() ? "(waiting for the ensemble ID)" : a.snap.spiFolder.c_str());
+    if (a.snap.epg && !a.snap.epg->empty()) {
+        ImGui::SameLine(0, ImGui::GetFontSize() * 0.6f);
+        if (epgButton()) g_openEpg = true;
+    }
     if (done) return;
 
     // progress bar (moving segment until the directory has arrived)
@@ -1401,7 +1428,7 @@ static std::string mjdDate(uint32_t mjd)
     const int mp = (int)((mjd - 14956.1 - (int)(yp * 365.25)) / 30.6001);
     const int d = (int)mjd - 14956 - (int)(yp * 365.25) - (int)(mp * 30.6001);
     const int k = mp == 14 || mp == 15;
-    char b[16];
+    char b[40];
     snprintf(b, sizeof(b), "%04d-%02d-%02d", yp + k + 1900, mp - 1 - k * 12, d);
     return b;
 }
@@ -1985,6 +2012,272 @@ static void muxInfoPopup(App &a)
     ImGui::EndPopup();
 }
 
+// ---------------------------------------------------------------------------
+// Programme guide (EPG from SPI): services one above the other, time running across
+
+static std::tm localTm(int64_t t)
+{
+    const time_t tt = (time_t)t;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    return tm;
+}
+
+// Local midnight at the start of the day containing t, plus `days` days
+static int64_t localMidnight(int64_t t, int days = 0)
+{
+    std::tm tm = localTm(t);
+    tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+    tm.tm_mday += days;
+    tm.tm_isdst = -1;
+    return (int64_t)mktime(&tm);
+}
+
+static std::string hhmm(int64_t t)
+{
+    const std::tm tm = localTm(t);
+    char b[8];
+    snprintf(b, sizeof(b), "%02d:%02d", tm.tm_hour, tm.tm_min);
+    return b;
+}
+
+static const char *programmeTitle(const EpgProgramme &p)
+{
+    if (!p.longName.empty()) return p.longName.c_str();
+    if (!p.mediumName.empty()) return p.mediumName.c_str();
+    return p.shortName.c_str();
+}
+
+static void epgPopup(App &a)
+{
+    static int64_t day = 0;          // local midnight of the day shown
+    static bool scrollToNow = false;
+    const int64_t nowT = (int64_t)time(nullptr);
+    if (g_openEpg) {
+        ImGui::OpenPopup("Programme guide");
+        g_openEpg = false;
+        day = localMidnight(nowT);
+        scrollToNow = true;
+    }
+    const ImVec2 vs = ImGui::GetMainViewport()->Size;
+    ImGui::SetNextWindowSize(ImVec2(vs.x * 0.96f, vs.y * 0.92f));
+    ImGui::SetNextWindowPos(ImVec2(vs.x * 0.5f, vs.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    if (!ImGui::BeginPopupModal("Programme guide", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    const std::shared_ptr<const EpgSchedule> epg = a.snap.epg;
+    if (!epg || epg->empty()) {
+        ImGui::TextDisabled("No programme information.");
+        ImGui::EndPopup();
+        return;
+    }
+
+    // rows: services in list order, then any others the EPG covers
+    std::vector<uint16_t> rows;
+    for (const auto &e : a.snap.services)
+        if (epg->count(e.sid)) rows.push_back(e.sid);
+    for (const auto &s : *epg)
+        if (std::find(rows.begin(), rows.end(), s.first) == rows.end()) rows.push_back(s.first);
+
+    // days with programmes
+    std::vector<int64_t> days;
+    for (const auto &s : *epg)
+        for (const auto &p : s.second) {
+            const int64_t d = localMidnight(p.start);
+            if (std::find(days.begin(), days.end(), d) == days.end()) days.push_back(d);
+        }
+    std::sort(days.begin(), days.end());
+    if (std::find(days.begin(), days.end(), day) == days.end()) {   // nearest day with data
+        auto it = std::lower_bound(days.begin(), days.end(), day);
+        day = it == days.end() ? days.back() : *it;
+    }
+    const int64_t dayEnd = localMidnight(day, 1);
+    const auto dayIt = std::find(days.begin(), days.end(), day);
+
+    // day selector
+    ImGui::BeginDisabled(dayIt == days.begin());
+    if (ImGui::ArrowButton("##prev", ImGuiDir_Left)) day = *(dayIt - 1);
+    handCursor();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    {
+        const std::tm tm = localTm(day);
+        char b[64];
+        strftime(b, sizeof(b), "%A %d %B %Y", &tm);
+        ImGui::AlignTextToFramePadding();
+        if (g_boldFont) ImGui::PushFont(g_boldFont, 0.0f);
+        ImGui::TextUnformatted(b);
+        if (g_boldFont) ImGui::PopFont();
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(dayIt + 1 == days.end());
+    if (ImGui::ArrowButton("##next", ImGuiDir_Right)) day = *(dayIt + 1);
+    handCursor();
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, ImGui::GetFontSize());
+    if (ImGui::Button("Now")) {
+        day = localMidnight(nowT);
+        scrollToNow = true;
+    }
+    handCursor();
+    ImGui::SameLine(0, ImGui::GetFontSize());
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Times are local. Shift + mouse wheel scrolls through the day; click a station to play it.");
+
+    // the grid
+    const float fs = ImGui::GetFontSize();
+    const float scale = ImGui::GetStyle().FontScaleDpi;
+    const float nameW = 200 * scale, pph = 230 * scale;   // name column, pixels per hour
+    const float headerH = fs * 1.6f, rowH = fs * 3.0f;
+    const float dayW = (float)(dayEnd - day) / 3600.0f * pph;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 0.02f));
+    ImGui::BeginChild("epggrid", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::PopStyleColor();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();   // content origin (moves with scrolling)
+    ImGui::Dummy(ImVec2(nameW + dayW, headerH + rows.size() * rowH));
+    const ImVec2 wp = ImGui::GetWindowPos();
+    const float ww = ImGui::GetWindowSize().x - (ImGui::GetScrollMaxY() > 0 ? ImGui::GetStyle().ScrollbarSize : 0);
+    const float wh = ImGui::GetWindowSize().y - (ImGui::GetScrollMaxX() > 0 ? ImGui::GetStyle().ScrollbarSize : 0);
+    if (scrollToNow) {
+        if (nowT >= day && nowT < dayEnd) ImGui::SetScrollX((float)(nowT - day) / 3600.0f * pph - pph * 0.5f);
+        scrollToNow = false;
+    }
+    auto xAt = [&](int64_t t) { return origin.x + nameW + (float)(t - day) / 3600.0f * pph; };
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool gridHov = ImGui::IsWindowHovered();
+    const ImVec2 area0(wp.x + nameW, wp.y + headerH), area1(wp.x + ww, wp.y + wh);   // programmes area
+    const ImU32 textCol = ImGui::GetColorU32(ImGuiCol_Text), dimCol = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    const EpgProgramme *tip = nullptr;
+    uint16_t tipSid = 0;
+
+    // programmes
+    dl->PushClipRect(area0, area1, true);
+    for (int h = 0; h <= 24; h++) {   // hour lines
+        const float x = xAt(day + h * 3600);
+        dl->AddLine(ImVec2(x, area0.y), ImVec2(x, area1.y), col(1, 1, 1, 0.05f));
+    }
+    for (size_t r = 0; r < rows.size(); r++) {
+        const float y = origin.y + headerH + r * rowH;
+        if (y + rowH < area0.y || y > area1.y) continue;
+        for (const EpgProgramme &p : epg->at(rows[r])) {
+            const int64_t end = p.start + std::max(p.duration, 60);
+            if (end <= day || p.start >= dayEnd) continue;
+            const float x0 = xAt(std::max(p.start, day)), x1 = xAt(std::min(end, dayEnd));
+            if (x1 < area0.x || x0 > area1.x) continue;
+            const ImVec2 b0(x0 + 1.5f * scale, y + 2 * scale), b1(x1 - 1.5f * scale, y + rowH - 2 * scale);
+            const bool onAir = nowT >= p.start && nowT < end;
+            const bool hov = gridHov && mouse.x >= std::max(b0.x, area0.x) && mouse.x < b1.x && mouse.y >= std::max(b0.y, area0.y) &&
+                             mouse.y < b1.y;
+            ImVec4 fill = onAir ? ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.30f) : ImVec4(1, 1, 1, 0.06f);
+            if (hov) fill.w += 0.08f;
+            dl->AddRectFilled(b0, b1, ImGui::GetColorU32(fill), 4 * scale);
+            if (hov) {
+                tip = &p;
+                tipSid = rows[r];
+            }
+            // text, kept in view when the block starts left of the visible area
+            const float pad = fs * 0.4f;
+            const float tx = std::max(b0.x + pad, area0.x + pad);
+            const float avail = b1.x - pad - tx;
+            if (avail < fs * 1.2f) continue;
+            dl->PushClipRect(b0, b1, true);
+            std::string title = programmeTitle(p);
+            if (ImGui::CalcTextSize(title.c_str()).x > avail && !p.mediumName.empty()) title = p.mediumName;
+            dl->AddText(ImVec2(tx, y + rowH * 0.5f - fs * 1.05f), textCol, fitText(title, avail).c_str());
+            const std::string when = hhmm(p.start) + " - " + hhmm(end);
+            dl->AddText(ImGui::GetFont(), fs * 0.82f, ImVec2(tx, y + rowH * 0.5f + fs * 0.1f), dimCol, when.c_str());
+            dl->PopClipRect();
+        }
+    }
+    if (nowT >= day && nowT < dayEnd) {   // now
+        const float x = xAt(nowT);
+        dl->AddLine(ImVec2(x, area0.y), ImVec2(x, origin.y + headerH + rows.size() * rowH), col(0.95f, 0.30f, 0.30f), 2 * scale);
+    }
+    dl->PopClipRect();
+
+    // time header (stays at the top)
+    const ImU32 bg = ImGui::GetColorU32(ImGuiCol_PopupBg);
+    dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(area1.x, area0.y), bg);
+    dl->PushClipRect(ImVec2(area0.x, wp.y), ImVec2(area1.x, area0.y), true);
+    for (int h = 0; h < 24; h++) {
+        const int64_t t = day + h * 3600;
+        const float x = xAt(t);
+        dl->AddLine(ImVec2(x, area0.y - fs * 0.4f), ImVec2(x, area0.y), col(1, 1, 1, 0.25f));
+        dl->AddLine(ImVec2(x + pph * 0.5f, area0.y - fs * 0.2f), ImVec2(x + pph * 0.5f, area0.y), col(1, 1, 1, 0.15f));
+        dl->AddText(ImVec2(x + fs * 0.25f, wp.y + (headerH - fs) * 0.35f), dimCol, hhmm(t).c_str());
+    }
+    if (nowT >= day && nowT < dayEnd) {
+        const float x = xAt(nowT);
+        dl->AddTriangleFilled(ImVec2(x - fs * 0.3f, area0.y - fs * 0.35f), ImVec2(x + fs * 0.3f, area0.y - fs * 0.35f),
+                              ImVec2(x, area0.y), col(0.95f, 0.30f, 0.30f));
+    }
+    dl->PopClipRect();
+
+    // station column (stays on the left)
+    dl->AddRectFilled(ImVec2(wp.x, area0.y), ImVec2(area0.x, area1.y), bg);
+    dl->PushClipRect(ImVec2(wp.x, area0.y), ImVec2(area0.x, area1.y), true);
+    const float logoSz = std::min(32 * scale, rowH - 8 * scale);
+    for (size_t r = 0; r < rows.size(); r++) {
+        const float y = origin.y + headerH + r * rowH;
+        if (y + rowH < area0.y || y > area1.y) continue;
+        const uint16_t sid = rows[r];
+        const ServiceEntry *e = findService(a, sid);
+        const ImVec2 r0(wp.x + 2 * scale, y + 2 * scale), r1(area0.x - 4 * scale, y + rowH - 2 * scale);
+        const bool hov = e && gridHov && mouse.x >= r0.x && mouse.x < r1.x && mouse.y >= std::max(r0.y, area0.y) &&
+                         mouse.y < r1.y && mouse.y < area1.y;
+        if (e && e->sid == a.snap.selectedSid)
+            dl->AddRectFilled(r0, r1, ImGui::GetColorU32(ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.28f)), 6 * scale);
+        else if (hov)
+            dl->AddRectFilled(r0, r1, ImGui::GetColorU32(ImGuiCol_HeaderHovered), 6 * scale);
+        if (hov) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && e->sid != a.snap.selectedSid) playService(a, e->sid);
+        }
+        const ImVec2 lp(wp.x + fs * 0.4f, y + (rowH - logoSz) * 0.5f);
+        const LogoTextures *lt = findLogos(a, sid);
+        if (lt && lt->logo32)
+            dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)lt->logo32), lp, ImVec2(lp.x + logoSz, lp.y + logoSz),
+                                ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 4 * scale);
+        else
+            dl->AddRectFilled(lp, ImVec2(lp.x + logoSz, lp.y + logoSz), col(1, 1, 1, 0.05f), 4 * scale);
+        const float tx = lp.x + logoSz + fs * 0.5f;
+        char sidTxt[16];
+        snprintf(sidTxt, sizeof(sidTxt), "%04X", sid);
+        const std::string name = e && !e->label.empty() ? e->label : std::string("SId ") + sidTxt;
+        dl->AddText(ImVec2(tx, y + rowH * 0.5f - fs * 1.05f), e ? textCol : dimCol, fitText(name, area0.x - tx - fs * 0.4f).c_str());
+        dl->AddText(ImGui::GetFont(), fs * 0.82f, ImVec2(tx, y + rowH * 0.5f + fs * 0.1f), dimCol,
+                    e ? sidTxt : (std::string(sidTxt) + "  not in this ensemble").c_str());
+    }
+    dl->PopClipRect();
+    dl->AddRectFilled(wp, ImVec2(area0.x, area0.y), bg);   // corner
+    ImGui::EndChild();
+
+    if (tip) {
+        const int64_t end = tip->start + tip->duration;
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(fs * 28);
+        if (g_boldFont) ImGui::PushFont(g_boldFont, 0.0f);
+        ImGui::TextUnformatted(programmeTitle(*tip));
+        if (g_boldFont) ImGui::PopFont();
+        const ServiceEntry *e = findService(a, tipSid);
+        ImGui::TextDisabled("%s - %s  (%d min)%s%s", hhmm(tip->start).c_str(), hhmm(end).c_str(), tip->duration / 60,
+                            e ? "   " : "", e ? e->label.c_str() : "");
+        if (!tip->description.empty()) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted(tip->description.c_str());
+        }
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+    ImGui::EndPopup();
+}
+
 static void logPopup(App &a)
 {
     ImVec2 vs = ImGui::GetMainViewport()->Size;
@@ -2055,6 +2348,7 @@ static void drawStatus(App &a)
 //   EDIPLAYER_COPY=<sec>              copy the shown slide / logo to the clipboard after <sec>
 //   EDIPLAYER_SERVICE_TIP=<hex>       keep this service's list tooltip open
 //   EDIPLAYER_MUXINFO=<sec>[:<px>]    open the ensemble information after <sec>, scrolled down <px>
+//   EDIPLAYER_EPG=<sec>               open the programme guide after <sec>
 
 static uint32_t crc32Png(const uint8_t *p, size_t n, uint32_t c = 0xFFFFFFFFu)
 {
@@ -2112,7 +2406,7 @@ static void writePng(const char *path, int w, int h, const std::vector<uint8_t> 
 
 struct TestHooks {
     std::vector<std::pair<double, std::string>> shots;
-    double exitAt = -1, recordAt = -1, copyAt = -1, muxInfoAt = -1;
+    double exitAt = -1, recordAt = -1, copyAt = -1, muxInfoAt = -1, epgAt = -1;
     float muxInfoScroll = -1;
     bool autostart = false;
     int sid = -1;
@@ -2130,6 +2424,7 @@ struct TestHooks {
         if (const char *r = getenv("EDIPLAYER_RECORD")) recordAt = atof(r);
         g_forceRateTooltip = getenv("EDIPLAYER_RATES") != nullptr;
         if (const char *c = getenv("EDIPLAYER_COPY")) copyAt = atof(c);
+        if (const char *e = getenv("EDIPLAYER_EPG")) epgAt = atof(e);
         if (const char *m = getenv("EDIPLAYER_MUXINFO")) {
             muxInfoAt = atof(m);
             if (const char *sc = strchr(m, ':')) muxInfoScroll = (float)atof(sc + 1);
@@ -2297,6 +2592,10 @@ int main(int, char **)
             g_muxInfoScroll = th.muxInfoScroll * scale;
             th.muxInfoAt = -1;
         }
+        if (th.epgAt >= 0 && now() - t0 >= th.epgAt) {
+            g_openEpg = true;
+            th.epgAt = -1;
+        }
         if (th.recordAt >= 0 && now() - t0 >= th.recordAt) {
             std::string err;
             a.player.startRecording(Recorder::Raw, err);
@@ -2330,6 +2629,7 @@ int main(int, char **)
         ImGui::EndChild();
         drawStatus(a);
         muxInfoPopup(a);
+        epgPopup(a);
         ImGui::End();
 
         ImGui::Render();

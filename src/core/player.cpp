@@ -305,9 +305,12 @@ void Player::Engine::updateSpi()
     std::map<uint16_t, ServiceLogos> logos;
     SharedBytes ensembleLogo;
     const bool newLogos = spi.takeLogos(logos, ensembleLogo);
+    std::shared_ptr<const EpgSchedule> epg;
+    const bool newEpg = spi.takeEpg(epg);
     const SpiProgress pr = spi.progress();
     std::lock_guard<std::mutex> lk(owner->mutex_);
     PlayerSnapshot &s = owner->snap_;
+    if (newEpg) s.epg = epg;
     if (newLogos) {
         s.logos = std::move(logos);
         s.ensembleLogo = ensembleLogo;

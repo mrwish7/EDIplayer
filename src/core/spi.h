@@ -13,7 +13,9 @@
 // time the ensemble is received the logos appear without waiting for the
 // carousel.
 //
-// The programme information (EPG schedules) is saved but not interpreted yet.
+// The binary Programme Information (EPG schedules, one object per service and
+// day) is decoded into an EpgSchedule. PI files saved by earlier sessions are
+// read back when the ensemble is selected.
 
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +39,17 @@ struct SpiProgress {
     int complete = 0;      // of which received
     bool directory = false;// at least one directory received
 };
+
+// One programme from the Programme Information
+struct EpgProgramme {
+    int64_t start = 0;            // UTC, seconds since 1970
+    int duration = 0;             // seconds
+    std::string shortName, mediumName, longName;
+    std::string description;
+};
+
+// Programmes by SId, each list sorted by start time
+using EpgSchedule = std::map<uint16_t, std::vector<EpgProgramme>>;
 
 // Image dimensions from a PNG / JPEG / GIF / BMP header (false if unknown)
 bool imageSize(const uint8_t *data, size_t len, int &w, int &h);
@@ -64,6 +77,8 @@ public:
     // Logos changed since the last call? `ensemble` is the ensemble's logo
     // (32x32 or nearest square), if it has one.
     bool takeLogos(std::map<uint16_t, ServiceLogos> &out, SharedBytes &ensemble);
+    // EPG changed since the last call?
+    bool takeEpg(std::shared_ptr<const EpgSchedule> &out);
     SpiProgress progress() const;
     std::string folder() const { return folder_; }
 
@@ -76,6 +91,8 @@ private:
 
     void onObject(const std::string &name, int ctype, int csub, bool compressed, const Bytes &body);
     void parseServiceInformation(const Bytes &body);
+    void parseProgrammeInformation(const std::string &name, const Bytes &body);
+    void loadSavedProgrammeInformation();
     void resolveLogos();
     void saveFile(const std::string &name, const Bytes &body);
     void writeIndex();
@@ -95,4 +112,6 @@ private:
     std::vector<std::pair<std::string, Bytes>> pendingSave_;                  // until the folder is known
     std::map<std::string, size_t> saved_;                                     // name -> size written
     bool logosChanged_ = false;
+    std::map<std::string, std::vector<std::pair<uint16_t, EpgProgramme>>> piFiles_;   // by file name
+    bool epgChanged_ = false;
 };
