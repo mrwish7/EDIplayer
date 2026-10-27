@@ -111,9 +111,43 @@ static void label_to_utf8(char *dst, const uint8_t *src, uint8_t charset)
     memmove(dst, dst + s, len - s + 1);
 }
 
+/* Short label: the characters picked by the 16-bit mask (bit 15 = first) */
+static void short_label_to_utf8(char *dst, const uint8_t *src, uint16_t mask, uint8_t charset)
+{
+    uint8_t pick[32];
+    size_t n = 0;
+    for (int i = 0, ch = 0; i < 16 && ch < 16; ch++) {
+        int cl = 1;                                           /* bytes in this character */
+        if (charset == CHARSET_UCS2) cl = 2;
+        else if (charset == CHARSET_UTF8)
+            while (i + cl < 16 && (src[i + cl] & 0xC0) == 0x80) cl++;
+        if (i + cl > 16) break;
+        if (mask & (0x8000 >> ch)) {
+            memcpy(pick + n, src + i, (size_t)cl);
+            n += (size_t)cl;
+        }
+        i += cl;
+    }
+    dab_text_to_utf8(dst, FIC_LABEL_MAX, pick, n, charset);
+}
+
 void fic_init(fic_state_t *s)
 {
     memset(s, 0, sizeof(*s));
+}
+
+static fic_service_t *find_or_add_service(fic_state_t *s, uint32_t sid, bool pd)
+{
+    for (int i = 0; i < s->n_services; i++)
+        if (s->services[i].sid == sid && s->services[i].pd == pd)
+            return &s->services[i];
+    if (s->n_services >= FIC_MAX_SVCS)
+        return NULL;
+    fic_service_t *sv = &s->services[s->n_services++];
+    memset(sv, 0, sizeof(*sv));
+    sv->sid = sid;
+    sv->pd  = pd;
+    return sv;
 }
 
 static svc_info_t *find_or_add(fic_state_t *s, uint16_t sid)
@@ -161,6 +195,12 @@ static void parse_fig0_2(fic_state_t *s, const uint8_t *d, int len, bool pd)
         uint16_t sid = (uint16_t)sid32;
         i += sid_len;
         int nsc = d[i] & 0x0F; /* actual component count */
+        fic_service_t *fs = find_or_add_service(s, sid32, pd);
+        if (fs) {
+            fs->local   = d[i] >> 7;
+            fs->caid    = (d[i] >> 4) & 0x07;
+            fs->n_comps = 0;
+        }
         i++;
 
         for (int c = 0; c < nsc && i + 2 <= len; c++) {
@@ -169,6 +209,15 @@ static void parse_fig0_2(fic_state_t *s, const uint8_t *d, int len, bool pd)
             uint8_t subchid = (d[i + 1] >> 2) & 0x3F;
             bool    primary = (d[i + 1] >> 1) & 0x01;
             uint16_t scid   = (uint16_t)(((d[i] & 0x3F) << 6) | (d[i + 1] >> 2));
+            if (fs && fs->n_comps < FIC_MAX_SVC_COMPS) {
+                fic_svc_comp_t *sc = &fs->comps[fs->n_comps++];
+                sc->tmid    = tmid;
+                sc->type    = tmid == 3 ? 0 : ty;
+                sc->subch   = subchid;
+                sc->scid    = tmid == 3 ? scid : 0;
+                sc->primary = primary;
+                sc->ca      = d[i + 1] & 0x01;
+            }
             i += 2;
 
             if (tmid == 3 && primary) { /* MSC packet data: remember for SPI lookup */
@@ -203,10 +252,21 @@ static void parse_fig0_2(fic_state_t *s, const uint8_t *d, int len, bool pd)
  *   short form: Table switch (1) | Table index (6)          -> UEP (table 8)
  *   long form:  Option (3) | Protection level (2) | Size (10) -> EEP
  */
-static const uint8_t uep_level[64] = {   /* protection level per UEP table index */
-    5, 4, 3, 2, 1,  5, 4, 3, 2, 1,  5, 4, 3, 2,  5, 4, 3, 2, 1,  5, 4, 3, 2, 1,
-    5, 4, 3, 2, 1,  5, 4, 3, 2,  5, 4, 3, 2, 1,  5, 4, 3, 2, 1,  5, 4, 3, 2, 1,
-    5, 4, 3, 2, 1,  5, 4, 3, 2, 1,  5, 4, 2,  5, 3, 1,
+static const struct { uint16_t size; uint8_t level; uint16_t kbps; } uep_table[64] = {   /* table 8 */
+    {16, 5, 32},   {21, 4, 32},   {24, 3, 32},   {29, 2, 32},   {35, 1, 32},
+    {24, 5, 48},   {29, 4, 48},   {35, 3, 48},   {42, 2, 48},   {52, 1, 48},
+    {29, 5, 56},   {35, 4, 56},   {42, 3, 56},   {52, 2, 56},
+    {32, 5, 64},   {42, 4, 64},   {48, 3, 64},   {58, 2, 64},   {70, 1, 64},
+    {40, 5, 80},   {52, 4, 80},   {58, 3, 80},   {70, 2, 80},   {84, 1, 80},
+    {48, 5, 96},   {58, 4, 96},   {70, 3, 96},   {84, 2, 96},   {104, 1, 96},
+    {58, 5, 112},  {70, 4, 112},  {84, 3, 112},  {104, 2, 112},
+    {64, 5, 128},  {84, 4, 128},  {96, 3, 128},  {116, 2, 128}, {140, 1, 128},
+    {80, 5, 160},  {104, 4, 160}, {116, 3, 160}, {140, 2, 160}, {168, 1, 160},
+    {96, 5, 192},  {116, 4, 192}, {140, 3, 192}, {168, 2, 192}, {208, 1, 192},
+    {116, 5, 224}, {140, 4, 224}, {168, 3, 224}, {208, 2, 224}, {232, 1, 224},
+    {128, 5, 256}, {168, 4, 256}, {192, 3, 256}, {232, 2, 256}, {280, 1, 256},
+    {160, 5, 320}, {208, 4, 320}, {280, 2, 320},
+    {192, 5, 384}, {280, 3, 384}, {416, 1, 384},
 };
 
 static void parse_fig0_1(fic_state_t *s, const uint8_t *d, int len)
@@ -214,21 +274,109 @@ static void parse_fig0_1(fic_state_t *s, const uint8_t *d, int len)
     int i = 0;
     while (i + 3 <= len) {
         uint8_t id = d[i] >> 2;
-        fic_subch_t sc;
-        memset(&sc, 0, sizeof(sc));
+        fic_subch_t sc = s->subch[id];   /* keep FEC and language */
         sc.valid = true;
+        sc.start = (uint16_t)(((d[i] & 0x03) << 8) | d[i + 1]);
         if (d[i + 2] & 0x80) {
             if (i + 4 > len) break;
             uint8_t option = (d[i + 2] >> 4) & 0x07;
             sc.eep   = true;
             sc.level = (uint8_t)(((d[i + 2] >> 2) & 0x03) + 1);
             sc.eep_b = option == 1;
+            sc.size  = (uint16_t)(((d[i + 2] & 0x03) << 8) | d[i + 3]);
+            /* EEP-A: 8n kbit/s in 12n/8n/6n/4n CUs; EEP-B: 32n kbit/s in 27n/21n/18n/15n CUs */
+            static const uint8_t cu_a[4] = {12, 8, 6, 4}, cu_b[4] = {27, 21, 18, 15};
+            sc.kbps = sc.eep_b ? (uint16_t)(sc.size / cu_b[sc.level - 1] * 32)
+                               : (uint16_t)(sc.size / cu_a[sc.level - 1] * 8);
             i += 4;
         } else {
-            sc.level = uep_level[d[i + 2] & 0x3F];
+            sc.eep       = false;
+            sc.eep_b     = false;
+            sc.uep_index = d[i + 2] & 0x3F;
+            sc.level     = uep_table[sc.uep_index].level;
+            sc.size      = uep_table[sc.uep_index].size;
+            sc.kbps      = uep_table[sc.uep_index].kbps;
             i += 3;
         }
         s->subch[id] = sc;
+    }
+}
+
+/* FIG 0/0 — Ensemble information. EId (16) | Change flags (2) | AL (1) |
+ * CIF count high (5) | CIF count low (8) | [Occurrence change (8)] */
+static void parse_fig0_0(fic_state_t *s, const uint8_t *d, int len)
+{
+    if (len < 4) return;
+    s->has_fig0_0   = true;
+    s->change_flags = d[2] >> 6;
+    s->al_flag      = (d[2] >> 5) & 0x01;
+    s->cif_count    = (uint16_t)((d[2] & 0x1F) * 250 + d[3]);
+    s->has_occurrence_change = s->change_flags && len >= 5;
+    if (s->has_occurrence_change) s->occurrence_change = d[4];
+}
+
+/* FIG 0/5 — Service component language.
+ *   L/S = 0: L/S (1) | MSC/FIC (1) | SubChId (6) | Language (8)
+ *   L/S = 1: L/S (1) | rfa (3) | SCId (12) | Language (8) */
+static void parse_fig0_5(fic_state_t *s, const uint8_t *d, int len)
+{
+    int i = 0;
+    while (i + 2 <= len) {
+        if (d[i] & 0x80) {
+            if (i + 3 > len) break;
+            uint16_t scid = (uint16_t)(((d[i] & 0x0F) << 8) | d[i + 1]);
+            int k;
+            for (k = 0; k < s->n_comp_langs && s->comp_langs[k].scid != scid; k++) {}
+            if (k == s->n_comp_langs && s->n_comp_langs < FIC_MAX_COMPS) s->n_comp_langs++;
+            if (k < FIC_MAX_COMPS) {
+                s->comp_langs[k].scid = scid;
+                s->comp_langs[k].lang = d[i + 2];
+            }
+            i += 3;
+        } else {
+            if (!(d[i] & 0x40)) {   /* MSC */
+                s->subch[d[i] & 0x3F].lang     = d[i + 1];
+                s->subch[d[i] & 0x3F].has_lang = true;
+            }
+            i += 2;
+        }
+    }
+}
+
+/* FIG 0/7 — Configuration information. Services (6) | Count (10) */
+static void parse_fig0_7(fic_state_t *s, const uint8_t *d, int len)
+{
+    if (len < 2) return;
+    s->has_fig0_7     = true;
+    s->cfg_services   = d[0] >> 2;
+    s->reconfig_count = (uint16_t)(((d[0] & 0x03) << 8) | d[1]);
+}
+
+/* FIG 0/10 — Date and time. rfu (1) | MJD (17) | LSI (1) | rfa (1) | UTC flag (1) |
+ * hours (5) | minutes (6) | [seconds (6) | milliseconds (10)] */
+static void parse_fig0_10(fic_state_t *s, const uint8_t *d, int len)
+{
+    if (len < 4) return;
+    s->mjd      = ((uint32_t)(d[0] & 0x7F) << 10) | ((uint32_t)d[1] << 2) | (d[2] >> 6);
+    s->lsi      = (d[2] >> 5) & 0x01;
+    s->utc_long = (d[2] >> 3) & 0x01;
+    s->hour     = (uint8_t)(((d[2] & 0x07) << 2) | (d[3] >> 6));
+    s->minute   = d[3] & 0x3F;
+    s->second   = 0;
+    s->ms       = 0;
+    if (s->utc_long && len >= 6) {
+        s->second = d[4] >> 2;
+        s->ms     = (uint16_t)(((d[4] & 0x03) << 8) | d[5]);
+    }
+    s->has_time = true;
+}
+
+/* FIG 0/14 — FEC sub-channel organisation. SubChId (6) | FEC scheme (2) */
+static void parse_fig0_14(fic_state_t *s, const uint8_t *d, int len)
+{
+    for (int i = 0; i < len; i++) {
+        s->subch[d[i] >> 2].fec     = d[i] & 0x03;
+        s->subch[d[i] >> 2].has_fec = true;
     }
 }
 
@@ -243,6 +391,7 @@ static void parse_fig0_17(fic_state_t *s, const uint8_t *d, int len)
     int i = 0;
     while (i + 4 <= len) {
         uint16_t sid = (uint16_t)((d[i] << 8) | d[i + 1]);
+        bool dynamic = d[i + 2] >> 7;
         bool l_flag  = (d[i + 2] >> 5) & 1;
         bool cc_flag = (d[i + 2] >> 4) & 1;
         int  off = i + 3 + (l_flag ? 1 : 0);
@@ -252,8 +401,9 @@ static void parse_fig0_17(fic_state_t *s, const uint8_t *d, int len)
 
         svc_info_t *sv = find_or_add(s, sid);
         if (sv) {
-            sv->pty     = pty;
-            sv->has_pty = true;
+            sv->pty         = pty;
+            sv->has_pty     = true;
+            sv->pty_dynamic = dynamic;
         }
     }
 }
@@ -332,6 +482,8 @@ static void parse_fig0_9(fic_state_t *s, const uint8_t *d, int len)
     if (len < 2) return;
     s->ecc     = d[1];
     s->has_ecc = true;
+    s->lto     = (int8_t)((d[0] & 0x20) ? -(d[0] & 0x1F) : (d[0] & 0x1F));
+    if (len >= 3) s->inter_table_id = d[2];
 
     /* Extended field (Ext flag): services whose ECC differs from the
      * ensemble's, in sub-fields of
@@ -485,11 +637,30 @@ int fic_find_packet_apps(const fic_state_t *s, uint16_t type, fic_app_comp_t *ou
 static void parse_fig1_0(fic_state_t *s, const uint8_t *d, int len,
                          uint8_t charset)
 {
-    if (len < 18)
+    if (len < 20)
         return;
     s->eid = ((uint16_t)d[0] << 8) | d[1];
     label_to_utf8(s->ens_label, d + 2, charset);
+    short_label_to_utf8(s->ens_short_label, d + 2, (uint16_t)((d[18] << 8) | d[19]), charset);
+    s->ens_charset   = charset;
     s->has_ens_label = true;
+}
+
+static void set_service_label(fic_state_t *s, uint32_t sid, bool pd, const uint8_t *d, uint8_t charset)
+{
+    fic_service_t *fs = find_or_add_service(s, sid, pd);
+    if (!fs) return;
+    label_to_utf8(fs->label, d, charset);
+    short_label_to_utf8(fs->short_label, d, (uint16_t)((d[16] << 8) | d[17]), charset);
+    fs->charset   = charset;
+    fs->has_label = true;
+}
+
+/* FIG 1/5 — Data service label: SId (32) | label (128) | short label flags (16) */
+static void parse_fig1_5(fic_state_t *s, const uint8_t *d, int len, uint8_t charset)
+{
+    if (len < 22) return;
+    set_service_label(s, read_sid(d, true), true, d + 4, charset);
 }
 
 /*
@@ -514,6 +685,7 @@ static void parse_fig1_1(fic_state_t *s, const uint8_t *d, int len,
             label_to_utf8(sv->label, d + i, charset);
             sv->has_label = true;
         }
+        set_service_label(s, sid, false, d + i, charset);
         i += 16 + 2; /* label + short label flag */
     }
 }
@@ -542,9 +714,15 @@ static void parse_fib(fic_state_t *s, const uint8_t *fib)
             uint8_t ext    = common & 0x1F;
             const uint8_t *fd = fig_data + 1;
             int            fl = fig_len - 1;
+            s->fig_count[0][ext]++;
             if (oe) continue;   /* other ensemble */
             switch (ext) {
+            case 0:  parse_fig0_0(s, fd, fl);      break;
             case 1:  if (!cn) parse_fig0_1(s, fd, fl); break;   /* current configuration only */
+            case 5:  parse_fig0_5(s, fd, fl);      break;
+            case 7:  parse_fig0_7(s, fd, fl);      break;
+            case 10: parse_fig0_10(s, fd, fl);     break;
+            case 14: if (!cn) parse_fig0_14(s, fd, fl); break;
             case 2:  parse_fig0_2(s, fd, fl, pd);  break;
             case 17: if (!pd) parse_fig0_17(s, fd, fl); break;
             case 18: if (!pd) parse_fig0_18(s, fd, fl); break;
@@ -560,10 +738,16 @@ static void parse_fib(fic_state_t *s, const uint8_t *fib)
             uint8_t common = fig_data[0];
             uint8_t charset = (common >> 4) & 0x0F;
             uint8_t ext     = common & 0x07;
+            s->fig_count[1][ext]++;
+            if (common & 0x08) continue;   /* other ensemble */
             if (ext == 0)
                 parse_fig1_0(s, fig_data + 1, fig_len - 1, charset);
             else if (ext == 1)
                 parse_fig1_1(s, fig_data + 1, fig_len - 1, charset);
+            else if (ext == 5)
+                parse_fig1_5(s, fig_data + 1, fig_len - 1, charset);
+        } else if (fig_len >= 1) {
+            s->fig_count[fig_type][fig_type == 2 ? fig_data[0] & 0x07 : 0]++;
         }
     }
 }

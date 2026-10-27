@@ -19,6 +19,12 @@ Runs on Windows and Linux (Dear ImGui + GLFW + OpenGL 3, miniaudio for sound).
 2. The services appear on the left once the FIC has been received. Click one to play it. The ensemble header shows the EId and ECC, and the country's flag on the right. The country comes from the ECC plus the first hex digit of the EId (ETSI TS 101 756), and the European area and Australia are covered.
 3. On the right are the slideshow (320×240), the dynamic label and any DL Plus items (title, artist, ...). Hover the slide for its name and click-through URL. Right-click it to copy the image to the clipboard. On Linux this needs `xclip` (X11) or `wl-copy` (Wayland).
 
+**Ensemble information.** The ⓘ button under the flag opens a window with everything the FIC says about the multiplex:
+
+- **Capacity units:** a bar of the 864 CUs, with the sub-channels in order of their start address and the free capacity hatched, plus a table giving each sub-channel's CU range, protection, bit rate and services. Hover a segment or a row to highlight it.
+- **Ensemble:** labels, EId, ECC, local time offset, date and time (FIG 0/10), transmission mode, CIF count, change and alarm flags, configuration count (FIG 0/7), announcement clusters, the EDI frame counter and timestamp, and how often each FIG has been received.
+- **Services:** every programme and data service with its labels, SId, country, programme type, announcements, and each component's type, sub-channel, CU range, protection, language and user applications (Slideshow, SPI, ...).
+
 Hovering a service in the list shows its details, including its own ECC and country. Services from abroad often carry an ECC that differs from the ensemble's (FIG 0/9 extended field).
 
 **Announcements.** If the playing service takes part in announcements (FIG 0/18, e.g. road traffic), a small pill next to its programme type names the types it supports. While an announcement is signalled for it (FIG 0/19), the pill turns green and shows the active type. EDIplayer only shows this; it doesn't switch to the announcement's sub-channel.

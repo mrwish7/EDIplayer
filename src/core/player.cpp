@@ -30,6 +30,8 @@ struct Player::Engine {
 
     fic_state_t fic;
     uint16_t mstSize[64] = {};
+    uint16_t mstStart[64] = {};       // EST start address
+    uint8_t mstTpl[64] = {};          // EST type and protection level
     uint64_t lastSeen[64] = {};       // frame counter when each SCID was last present
     std::atomic<uint64_t> frames{0};  // read by the GUI thread for statistics
     std::string listKey;              // detects service list changes
@@ -96,6 +98,7 @@ struct Player::Engine {
     void processFrame(const edi_frame_t &frame);
     void updateServiceList();
     void updateSpi();
+    void updateMuxInfo(const edi_frame_t &frame);
     void select(int newSid);
 };
 
@@ -315,6 +318,32 @@ void Player::Engine::updateSpi()
     s.ecc = fic.has_ecc ? fic.ecc : -1;
 }
 
+void Player::Engine::updateMuxInfo(const edi_frame_t &frame)
+{
+    auto m = std::make_shared<MuxInfo>();
+    m->fic = fic;
+    for (int sc = 0; sc < 64; sc++) {
+        if (!lastSeen[sc] || frames - lastSeen[sc] > kPresentFrames) continue;
+        MuxInfo::Stream st;
+        st.subch = sc;
+        st.start = mstStart[sc];
+        st.tpl = mstTpl[sc];
+        st.bytes = mstSize[sc];
+        m->streams.push_back(st);
+    }
+    if (frame.deti_valid) {
+        m->mode = frame.deti.mid;
+        m->ficLen = frame.deti.ficf ? frame.deti.fic_len : 0;
+        m->dflc = frame.deti.dflc;
+        m->atst = frame.deti.atstf;
+        m->utco = frame.deti.utco;
+        m->seconds = frame.deti.seconds;
+    }
+    m->frames = frames;
+    std::lock_guard<std::mutex> lk(owner->mutex_);
+    owner->snap_.mux = std::move(m);
+}
+
 void Player::Engine::select(int newSid)
 {
     sid = newSid;
@@ -343,12 +372,15 @@ void Player::Engine::processFrame(const edi_frame_t &frame)
         const est_t &e = frame.est[i];
         if (!e.valid) continue;
         mstSize[e.scid] = e.mst_size;
+        mstStart[e.scid] = e.sad;
+        mstTpl[e.scid] = e.tpl;
         lastSeen[e.scid] = frames;
         if (spi.hasSubchannel(e.scid)) spi.feed(e.scid, e.mst, e.mst_size);
     }
     if (frames % kListInterval == 1) {
         updateServiceList();
         updateSpi();
+        updateMuxInfo(frame);
     }
 
     int pend = owner->pendingSid_.exchange(-2);

@@ -10,6 +10,9 @@
 #include "edi_source.h"
 #include "recorder.h"
 #include "spi.h"
+extern "C" {
+#include "edi/fic.h"
+}
 
 #include <atomic>
 #include <cstdint>
@@ -56,6 +59,26 @@ struct Slide {
     std::string clickUrl;
 };
 
+// Everything known about the multiplex, for the ensemble information view
+struct MuxInfo {
+    fic_state_t fic;                       // the decoded FIC
+    struct Stream {                        // a sub-channel present in the EDI stream (EST tag)
+        int subch = 0;
+        int start = 0;                     // start address, CUs
+        int tpl = 0;                       // type and protection level
+        int bytes = 0;                     // per 24 ms frame
+    };
+    std::vector<Stream> streams;           // by sub-channel
+    // DETI (ETSI TS 102 693)
+    int mode = 0;                          // mode identity (1..3; 0 = mode IV)
+    int ficLen = 0;                        // FIC bytes per 24 ms frame
+    int dflc = 0;                          // frame counter, 0..4999
+    bool atst = false;                     // timestamp present
+    int utco = 0;                          // UTC offset (TAI - UTC - 32 s)
+    uint32_t seconds = 0;                  // seconds since 2000-01-01, TAI
+    uint64_t frames = 0;                   // frames received
+};
+
 struct PlayerSnapshot {
     bool running = false;
     EdiSource::State sourceState = EdiSource::State::Idle;
@@ -66,6 +89,7 @@ struct PlayerSnapshot {
     int ecc = -1;                          // Extended Country Code (FIG 0/9), -1 until known
     std::string ensemble;
     std::vector<ServiceEntry> services;   // audio services, sorted by label
+    std::shared_ptr<const MuxInfo> mux;    // refreshed every ~0.5 s
 
     int selectedSid = -1;
     std::string audioFormat;               // e.g. "HE-AAC v2, 48 kHz, stereo (PS)"

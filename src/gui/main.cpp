@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -485,6 +486,7 @@ static void pollPlayer(App &a)
 
 static ImU32 col(float r, float g, float b, float al = 1.0f) { return ImGui::GetColorU32(ImVec4(r, g, b, al)); }
 static const ImVec4 kAccent(0.20f, 0.55f, 0.95f, 1.0f);
+static ImFont *g_boldFont = nullptr;   // loaded in loadFont(); nullptr if none was found
 
 // Hand pointer over clickable items (disabled items don't report hovering)
 static void handCursor()
@@ -662,6 +664,27 @@ static std::string announcementList(uint16_t flags, bool upper)
 }
 
 static int g_forceServiceTip = -1;   // test hook EDIPLAYER_SERVICE_TIP
+static bool g_openMuxInfo = false;   // set by the info button, opened at the main window level
+static float g_muxInfoScroll = -1;   // test hook: scroll the ensemble information to this position
+
+// Small round "i" button drawn at p (no layout), returns true when clicked
+static bool infoButton(ImVec2 p, float sz, const char *tip)
+{
+    const ImVec2 q(p.x + sz, p.y + sz), c(p.x + sz * 0.5f, p.y + sz * 0.5f);
+    const bool hov = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(p, q);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImU32 fg = ImGui::GetColorU32(hov ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+    if (hov) dl->AddCircleFilled(c, sz * 0.5f, ImGui::GetColorU32(ImGuiCol_ButtonHovered), 24);
+    dl->AddCircle(c, sz * 0.5f - 0.5f, fg, 24, 1.2f);
+    ImFont *f = g_boldFont ? g_boldFont : ImGui::GetFont();
+    const float ts = sz * 0.78f;
+    const ImVec2 tsz = f->CalcTextSizeA(ts, FLT_MAX, 0, "i");
+    dl->AddText(f, ts, ImVec2(c.x - tsz.x * 0.5f, c.y - tsz.y * 0.5f), fg, "i");
+    if (!hov) return false;
+    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImGui::SetTooltip("%s", tip);
+    return ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+}
 
 // Service list tooltip: identity (with the service's own country), format, PTY, announcements
 static void drawServiceTooltip(App &a, const ServiceEntry &e, const std::string &name)
@@ -773,6 +796,13 @@ static void drawServices(App &a, float width)
                                                     IM_COL32_WHITE, 2.0f * ImGui::GetStyle().FontScaleDpi);
         if (ImGui::IsMouseHoveringRect(fp, ImVec2(fp.x + flagW, fp.y + flagH)))
             ImGui::SetTooltip("%s\nECC %02X, country id %X", country->name, s.ecc, s.eid >> 12);
+    }
+    // ensemble information button, below the flag
+    if (s.mux && !s.services.empty()) {
+        const float sz = flagH;
+        const float cx = flag ? hp.x + hw - flagW * 0.5f : hp.x + hw - sz * 0.5f;
+        const float y = ImGui::GetCursorScreenPos().y + (ImGui::GetTextLineHeight() - sz) * 0.5f;
+        if (infoButton(ImVec2(cx - sz * 0.5f, y), sz, "Ensemble information")) g_openMuxInfo = true;
     }
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     char sub[96] = "";
@@ -900,7 +930,6 @@ static void drawVolume(App &a, float width)
     if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings(a);
 }
 
-static ImFont *g_boldFont = nullptr;   // loaded in loadFont(); nullptr if none was found
 
 // Record pill geometry: compact, sized to sit on a line of text; the label
 // is small bold capitals
@@ -1285,6 +1314,677 @@ static void drawNowPlaying(App &a)
     endPanel();
 }
 
+// ---------------------------------------------------------------------------
+// Ensemble information: capacity map and everything from the FIC
+
+static const int kTotalCus = 864;   // capacity units per CIF (all transmission modes)
+
+static std::string hex(uint32_t v, int digits)
+{
+    char b[16];
+    snprintf(b, sizeof(b), "%0*X", digits, v);
+    return b;
+}
+
+static const char *userAppName(int t)   // ETSI TS 101 756 table 16
+{
+    switch (t) {
+    case 0x002: return "Slideshow";
+    case 0x003: return "Broadcast Web Site";
+    case 0x004: return "TPEG";
+    case 0x005: return "DGPS";
+    case 0x006: return "TMC";
+    case 0x007: return "SPI";
+    case 0x008: return "DAB Java";
+    case 0x009: return "DMB";
+    case 0x00A: return "IPDC services";
+    case 0x00B: return "Voice applications";
+    case 0x00C: return "Middleware";
+    case 0x00D: return "Filecasting";
+    case 0x44A: return "Journaline";
+    default: return nullptr;
+    }
+}
+
+static std::string dscTyName(int t)   // ETSI TS 101 756 table 2b
+{
+    switch (t) {
+    case 0: return "unspecified data";
+    case 1: return "TMC";
+    case 2: return "EWS";
+    case 3: return "ITTS";
+    case 4: return "paging";
+    case 5: return "TDC";
+    case 24: return "MPEG-2 TS";
+    case 59: return "IP";
+    case 60: return "MOT";
+    case 61: return "proprietary";
+    default: return "DSCTy " + std::to_string(t);
+    }
+}
+
+static const char *languageName(int l)   // ETSI TS 101 756 table 9 (European languages)
+{
+    static const char *const names[] = {
+        "unknown", "Albanian", "Breton", "Catalan", "Croatian", "Welsh", "Czech", "Danish", "German", "English",
+        "Spanish", "Esperanto", "Estonian", "Basque", "Faroese", "French", "Frisian", "Irish", "Gaelic", "Galician",
+        "Icelandic", "Italian", "Sami", "Latin", "Latvian", "Luxembourgish", "Lithuanian", "Hungarian", "Maltese",
+        "Dutch", "Norwegian", "Occitan", "Polish", "Portuguese", "Romanian", "Romansh", "Serbian", "Slovak",
+        "Slovene", "Finnish", "Swedish", "Turkish", "Flemish", "Walloon",
+    };
+    return l >= 0 && l < (int)(sizeof(names) / sizeof(names[0])) ? names[l] : nullptr;
+}
+
+static std::string language(int l)
+{
+    const char *n = languageName(l);
+    return n ? n : "language 0x" + hex(l, 2);
+}
+
+static const char *charsetName(int c)
+{
+    return c == 0 ? "EBU Latin" : c == 6 ? "UCS-2" : c == 15 ? "UTF-8" : "other";
+}
+
+static std::string protectionText(const fic_subch_t &sc)
+{
+    char b[24];
+    if (sc.eep) snprintf(b, sizeof(b), "EEP-%d%c", sc.level, sc.eep_b ? 'B' : 'A');
+    else snprintf(b, sizeof(b), "UEP-%d", sc.level);
+    return b;
+}
+
+// "2026-10-27" from a Modified Julian Date (EN 300 468 annex C)
+static std::string mjdDate(uint32_t mjd)
+{
+    const int yp = (int)((mjd - 15078.2) / 365.25);
+    const int mp = (int)((mjd - 14956.1 - (int)(yp * 365.25)) / 30.6001);
+    const int d = (int)mjd - 14956 - (int)(yp * 365.25) - (int)(mp * 30.6001);
+    const int k = mp == 14 || mp == 15;
+    char b[16];
+    snprintf(b, sizeof(b), "%04d-%02d-%02d", yp + k + 1900, mp - 1 - k * 12, d);
+    return b;
+}
+
+static std::string serviceName(const fic_service_t &s)
+{
+    return s.has_label && s.label[0] ? s.label : "SId " + hex(s.sid, s.pd ? 8 : 4);
+}
+
+static const fic_packet_comp_t *packetComp(const fic_state_t &f, uint16_t scid)
+{
+    for (int k = 0; k < f.n_packet; k++)
+        if (f.packet[k].scid == scid) return &f.packet[k];
+    return nullptr;
+}
+
+// Sub-channel of a component, -1 if none (FIDC) or not yet known
+static int compSubch(const fic_state_t &f, const fic_svc_comp_t &c)
+{
+    if (c.tmid == 0 || c.tmid == 1) return c.subch;
+    if (c.tmid == 3)
+        if (const fic_packet_comp_t *p = packetComp(f, c.scid)) return p->subch;
+    return -1;
+}
+
+// SCIdS of a component (0 for the primary one; secondary ones from FIG 0/8), -1 unknown
+static int compScids(const fic_state_t &f, const fic_service_t &s, const fic_svc_comp_t &c)
+{
+    if (c.primary) return 0;
+    for (int k = 0; k < f.n_defs; k++) {
+        const fic_comp_def_t &d = f.defs[k];
+        if (d.sid != s.sid) continue;
+        if (c.tmid == 3 ? d.long_form && d.scid == c.scid : !d.long_form && d.subch == c.subch) return d.scids;
+    }
+    return -1;
+}
+
+// One sub-channel of the capacity map
+struct SubchUse {
+    int id = 0;
+    fic_subch_t sc{};
+    std::string kind;                     // "DAB+", "DAB", "packet data", ...
+    std::vector<std::string> users;       // services using it
+    ImU32 color = 0;
+};
+
+static std::vector<SubchUse> subchannelUses(const MuxInfo &m)
+{
+    const fic_state_t &f = m.fic;
+    std::vector<SubchUse> out;
+    for (int id = 0; id < 64; id++) {
+        if (!f.subch[id].valid || !f.subch[id].size) continue;
+        // FIG 0/1 can still describe sub-channels removed by a reconfiguration:
+        // keep those the EDI stream carries
+        bool present = m.streams.empty();
+        for (const auto &st : m.streams) present |= st.subch == id;
+        if (!present) continue;
+        SubchUse u;
+        u.id = id;
+        u.sc = f.subch[id];
+        for (int i = 0; i < f.n_services; i++) {
+            const fic_service_t &s = f.services[i];
+            for (int c = 0; c < s.n_comps; c++) {
+                const fic_svc_comp_t &comp = s.comps[c];
+                if (compSubch(f, comp) != id) continue;
+                const std::string name = serviceName(s);
+                if (std::find(u.users.begin(), u.users.end(), name) == u.users.end())   // primary users first
+                    u.users.insert(comp.primary ? u.users.begin() : u.users.end(), name);
+                if (u.kind.empty() || comp.primary)
+                    u.kind = comp.tmid == 0 ? (comp.type == ASCTY_DABPLUS ? "DAB+" : comp.type == ASCTY_MP2 ? "DAB" : "audio")
+                             : comp.tmid == 3 ? "packet data"
+                                              : "stream data";
+            }
+        }
+        out.push_back(u);
+    }
+    std::sort(out.begin(), out.end(), [](const SubchUse &a, const SubchUse &b) { return a.sc.start < b.sc.start; });
+    static const ImVec4 palette[] = {
+        {0.27f, 0.52f, 0.96f, 1}, {0.13f, 0.72f, 0.50f, 1}, {0.96f, 0.62f, 0.07f, 1}, {0.96f, 0.30f, 0.40f, 1},
+        {0.07f, 0.71f, 0.85f, 1}, {0.40f, 0.40f, 0.95f, 1}, {0.52f, 0.80f, 0.10f, 1}, {0.93f, 0.29f, 0.60f, 1},
+        {0.98f, 0.45f, 0.09f, 1}, {0.08f, 0.72f, 0.65f, 1}, {0.85f, 0.27f, 0.94f, 1}, {0.60f, 0.45f, 0.95f, 1},
+    };
+    for (size_t i = 0; i < out.size(); i++)
+        out[i].color = ImGui::GetColorU32(palette[i % (sizeof(palette) / sizeof(palette[0]))]);
+    return out;
+}
+
+static std::string joined(const std::vector<std::string> &v, const char *sep = ", ")
+{
+    std::string s;
+    for (const auto &x : v) s += (s.empty() ? "" : sep) + x;
+    return s;
+}
+
+static void panelTitle(const char *title, const char *sub)
+{
+    if (g_boldFont) ImGui::PushFont(g_boldFont, 0.0f);
+    ImGui::TextUnformatted(title);
+    if (g_boldFont) ImGui::PopFont();
+    if (sub) {
+        ImGui::SameLine(0, ImGui::GetFontSize() * 0.6f);
+        ImGui::TextDisabled("%s", sub);
+    }
+}
+
+// Capacity map: the sub-channels in order of their start address, like a disk map
+static void drawCapacity(const MuxInfo &m)
+{
+    static int hovered = -1;   // sub-channel under the mouse (bar or table), from the last frame
+    int hoverNow = -1;
+    const std::vector<SubchUse> uses = subchannelUses(m);
+    int used = 0;
+    for (const auto &u : uses) used += u.sc.size;
+
+    beginPanel("capacity", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float fs = ImGui::GetFontSize();
+    const float scale = ImGui::GetStyle().FontScaleDpi;
+
+    // title, and "862 / 864" on the right
+    const ImVec2 tp = ImGui::GetCursorScreenPos();
+    ImFont *bf = g_boldFont ? g_boldFont : ImGui::GetFont();
+    char usedTxt[16], totalTxt[16];
+    snprintf(usedTxt, sizeof(usedTxt), "%d", used);
+    snprintf(totalTxt, sizeof(totalTxt), " / %d", kTotalCus);
+    ImGui::PushFont(bf, ImGui::GetStyle().FontSizeBase * 1.9f);
+    const float bigPx = ImGui::GetFontSize();
+    const ImVec2 usedSz = ImGui::CalcTextSize(usedTxt);
+    const float bigAscent = bf->GetFontBaked(bigPx)->Ascent;
+    ImGui::PopFont();
+    const ImVec2 totalSz = ImGui::CalcTextSize(totalTxt);
+    const float smallAscent = ImGui::GetFont()->GetFontBaked(fs)->Ascent;
+    const float rightX = tp.x + ImGui::GetContentRegionAvail().x;
+    const float titleH = usedSz.y;
+    ImGui::SetCursorScreenPos(ImVec2(tp.x, tp.y + (titleH - fs) * 0.5f));
+    panelTitle("Capacity units", "sub-channels by start address (FIG 0/1)");
+    const ImU32 green = col(0.25f, 0.82f, 0.58f);
+    dl->AddText(bf, bigPx, ImVec2(rightX - totalSz.x - usedSz.x, tp.y), green, usedTxt);
+    dl->AddText(ImVec2(rightX - totalSz.x, tp.y + bigAscent - smallAscent), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                totalTxt);   // on the same baseline
+    ImGui::SetCursorScreenPos(ImVec2(tp.x, tp.y + titleH + ImGui::GetStyle().ItemSpacing.y * 0.6f));
+
+    // the bar; free capacity hatched
+    const ImVec2 bp = ImGui::GetCursorScreenPos();
+    const float bw = ImGui::GetContentRegionAvail().x, bh = fs * 1.15f, r = bh * 0.35f;
+    dl->AddRectFilled(bp, ImVec2(bp.x + bw, bp.y + bh), col(1, 1, 1, 0.05f), r);
+    dl->PushClipRect(bp, ImVec2(bp.x + bw, bp.y + bh), true);
+    for (float x = -bh; x < bw; x += 6 * scale)
+        dl->AddLine(ImVec2(bp.x + x, bp.y + bh), ImVec2(bp.x + x + bh, bp.y), col(1, 1, 1, 0.06f), 1.0f);
+    dl->PopClipRect();
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool barHovered = ImGui::IsWindowHovered() && mouse.y >= bp.y && mouse.y < bp.y + bh;
+    for (const auto &u : uses) {
+        const float x0 = bp.x + bw * u.sc.start / kTotalCus;
+        const float x1 = bp.x + bw * (u.sc.start + u.sc.size) / kTotalCus;
+        ImDrawFlags rf = ImDrawFlags_RoundCornersNone;
+        if (u.sc.start == 0) rf |= ImDrawFlags_RoundCornersLeft;
+        if (u.sc.start + u.sc.size >= kTotalCus) rf |= ImDrawFlags_RoundCornersRight;
+        ImVec4 c = ImGui::ColorConvertU32ToFloat4(u.color);
+        if (hovered >= 0 && hovered != u.id) {   // fade the others towards the background (opaque: hides the hatching)
+            const ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_PopupBg);
+            c = ImVec4(bg.x + (c.x - bg.x) * 0.35f, bg.y + (c.y - bg.y) * 0.35f, bg.z + (c.z - bg.z) * 0.35f, 1);
+        }
+        dl->AddRectFilled(ImVec2(x0, bp.y), ImVec2(std::max(x0 + 1, x1 - 1), bp.y + bh), ImGui::GetColorU32(c), r, rf);
+        if (barHovered && mouse.x >= x0 && mouse.x < x1) hoverNow = u.id;
+    }
+    ImGui::Dummy(ImVec2(bw, bh));
+
+    // scale below the bar
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.78f);
+    {
+        const float sfs = ImGui::GetFontSize();
+        const ImVec2 sp = ImGui::GetCursorScreenPos();
+        const float y = sp.y - ImGui::GetStyle().ItemSpacing.y * 0.6f;
+        for (int t = 0; t <= kTotalCus; t += kTotalCus / 4) {
+            char b[8];
+            snprintf(b, sizeof(b), "%d", t);
+            const float tw = ImGui::CalcTextSize(b).x;
+            float x = bp.x + bw * t / kTotalCus - (t == 0 ? 0 : t == kTotalCus ? tw : tw * 0.5f);
+            dl->AddText(ImVec2(x, y), ImGui::GetColorU32(ImGuiCol_TextDisabled), b);
+        }
+        ImGui::Dummy(ImVec2(bw, sfs - ImGui::GetStyle().ItemSpacing.y * 0.6f));
+    }
+    ImGui::PopFont();
+
+    // one row per sub-channel, in the same order and colours
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.9f);
+    const ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
+    if (!uses.empty() && ImGui::BeginTable("subch", 9, tf)) {
+        ImGui::TableSetupColumn("SubCh");
+        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("End");
+        ImGui::TableSetupColumn("CUs");
+        ImGui::TableSetupColumn("Share");
+        ImGui::TableSetupColumn("Protection");
+        ImGui::TableSetupColumn("Bit rate");
+        ImGui::TableSetupColumn("Type");
+        ImGui::TableSetupColumn("Service", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TableHeadersRow();
+        ImGui::PopStyleColor();
+        for (const auto &u : uses) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const ImVec2 cp = ImGui::GetCursorScreenPos();
+            const float sw = ImGui::GetFontSize() * 0.7f;
+            ImGui::PushID(u.id);
+            ImGui::Selectable("##row", hovered == u.id, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap);
+            if (ImGui::IsItemHovered()) hoverNow = u.id;
+            ImGui::PopID();
+            const float th = ImGui::GetTextLineHeight();
+            ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(cp.x, cp.y + (th - sw) * 0.5f),
+                                                      ImVec2(cp.x + sw, cp.y + (th + sw) * 0.5f), u.color, 2 * scale);
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorScreenPos(ImVec2(cp.x + sw + fs * 0.4f, cp.y));
+            ImGui::Text("%d", u.id);
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", u.sc.start);
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", u.sc.start + u.sc.size - 1);
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", u.sc.size);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f %%", 100.0 * u.sc.size / kTotalCus);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(protectionText(u.sc).c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%d kbit/s", u.sc.kbps);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(u.kind.empty() ? "-" : u.kind.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(u.users.empty() ? "(not used by a service)" : joined(u.users).c_str());
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopFont();
+    if (uses.empty()) ImGui::TextDisabled("Waiting for the sub-channel organisation (FIG 0/1)...");
+    else if (used < kTotalCus) ImGui::TextDisabled("%d CUs free (%.1f %%)", kTotalCus - used, 100.0 * (kTotalCus - used) / kTotalCus);
+    endPanel();
+
+    // tooltip for the bar
+    if (hoverNow >= 0 && barHovered)
+        for (const auto &u : uses) {
+            if (u.id != hoverNow) continue;
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(u.users.empty() ? "(not used by a service)" : joined(u.users).c_str());
+            ImGui::TextDisabled("Sub-channel %d   CUs %d-%d (%d)", u.id, u.sc.start, u.sc.start + u.sc.size - 1, u.sc.size);
+            ImGui::TextDisabled("%s, %d kbit/s%s%s", protectionText(u.sc).c_str(), u.sc.kbps, u.kind.empty() ? "" : ", ",
+                                u.kind.c_str());
+            ImGui::EndTooltip();
+        }
+    hovered = hoverNow;
+}
+
+// Key / value pairs, two per row
+static void drawPairs(const char *id, const std::vector<std::pair<std::string, std::string>> &items)
+{
+    if (!ImGui::BeginTable(id, 4, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_PadOuterX)) return;
+    // the same key width everywhere, so all the tables line up
+    const float kw = ImGui::CalcTextSize("Announcement clusters").x;
+    ImGui::TableSetupColumn("k1", ImGuiTableColumnFlags_WidthFixed, kw);
+    ImGui::TableSetupColumn("v1", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("k2", ImGuiTableColumnFlags_WidthFixed, kw);
+    ImGui::TableSetupColumn("v2", ImGuiTableColumnFlags_WidthStretch);
+    for (size_t i = 0; i < items.size(); i++) {
+        if (i % 2 == 0) ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", items[i].first.c_str());
+        ImGui::TableNextColumn();
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextUnformatted(items[i].second.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::EndTable();
+}
+
+static void drawEnsembleInfo(const MuxInfo &m)
+{
+    const fic_state_t &f = m.fic;
+    beginPanel("ensemble", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+    panelTitle("Ensemble", "FIG 0/0, 0/7, 0/9, 0/10, 1/0 and the EDI frame (DETI)");
+    ImGui::Spacing();
+    std::vector<std::pair<std::string, std::string>> it;
+    char b[160];
+
+    it.push_back({"Label", f.has_ens_label ? f.ens_label : "-"});
+    it.push_back({"Short label", f.has_ens_label ? f.ens_short_label : "-"});
+    it.push_back({"EId", hex(f.eid, 4)});
+    std::string cc = f.has_ecc ? hex(f.ecc, 2) : "-";
+    if (f.has_ecc)
+        if (const Country *c = dabCountry(f.ecc, f.eid)) cc += std::string("  ") + c->name;
+    it.push_back({"ECC", cc});
+    it.push_back({"Character set", f.has_ens_label ? charsetName(f.ens_charset) : "-"});
+    if (f.has_ecc) {
+        const int lto = f.lto * 30;
+        snprintf(b, sizeof(b), "UTC%c%02d:%02d", lto < 0 ? '-' : '+', abs(lto) / 60, abs(lto) % 60);
+        it.push_back({"Local time offset", b});
+        it.push_back({"International table", f.inter_table_id == 1 ? "1 (Europe: RDS PTYs)"
+                                             : f.inter_table_id == 2 ? "2 (North America: RBDS PTYs)"
+                                                                     : std::to_string(f.inter_table_id)});
+    }
+    if (f.has_time) {
+        snprintf(b, sizeof(b), "%s %02d:%02d", mjdDate(f.mjd).c_str(), f.hour, f.minute);
+        std::string t = b;
+        if (f.utc_long) {
+            snprintf(b, sizeof(b), ":%02d.%03d", f.second, f.ms);
+            t += b;
+        }
+        it.push_back({"Date and time", t + " UTC" + (f.lsi ? " (leap second)" : "")});
+    } else {
+        it.push_back({"Date and time", "not signalled (FIG 0/10)"});
+    }
+    if (m.mode >= 0) {
+        static const char *const modes[4] = {"IV", "I", "II", "III"};
+        it.push_back({"Transmission mode", modes[m.mode & 3]});
+    }
+    if (m.ficLen) {
+        snprintf(b, sizeof(b), "%d bytes / 24 ms (%d FIBs)", m.ficLen, m.ficLen / 32);
+        it.push_back({"FIC", b});
+    }
+    if (f.has_fig0_0) {
+        it.push_back({"CIF count", std::to_string(f.cif_count)});
+        static const char *const changes[4] = {"none", "sub-channels", "services", "sub-channels and services"};
+        std::string ch = changes[f.change_flags & 3];
+        if (f.has_occurrence_change) ch += " at CIF " + std::to_string(f.occurrence_change);
+        it.push_back({"Change announced", ch});
+        it.push_back({"Alarm announcements", f.al_flag ? "enabled (AL flag)" : "not enabled"});
+    }
+    if (f.has_fig0_7) {
+        snprintf(b, sizeof(b), "%d services, reconfiguration %d", f.cfg_services, f.reconfig_count);
+        it.push_back({"Configuration", b});
+    }
+    int prog = 0, data = 0;
+    for (int i = 0; i < f.n_services; i++) (f.services[i].pd ? data : prog)++;
+    snprintf(b, sizeof(b), "%d programme, %d data", prog, data);
+    it.push_back({"Services", b});
+    int nsub = 0, used = 0;
+    for (const auto &u : subchannelUses(m)) {
+        nsub++;
+        used += u.sc.size;
+    }
+    snprintf(b, sizeof(b), "%d (%d of %d CUs used)", nsub, used, kTotalCus);
+    it.push_back({"Sub-channels", b});
+    it.push_back({"EDI frame counter", std::to_string(m.dflc)});
+    if (m.atst && !m.seconds) {
+        it.push_back({"EDI timestamp", "flagged but not set (zero)"});
+    } else if (m.atst) {
+        // TS 102 693: Seconds counts from 2000-01-01 00:00 UTC on the TAI time scale
+        // less 32 s; UTCO is the remaining TAI-UTC offset (TAI-UTC - 32 s)
+        const time_t t = (time_t)946684800 + (time_t)m.seconds - m.utco;
+        std::tm tm{};
+#ifdef _WIN32
+        gmtime_s(&tm, &t);
+#else
+        gmtime_r(&t, &tm);
+#endif
+        strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S UTC", &tm);
+        it.push_back({"EDI timestamp", b});
+    }
+    snprintf(b, sizeof(b), "%llu (%.0f s)", (unsigned long long)m.frames, m.frames * 0.024);
+    it.push_back({"Frames received", b});
+
+    // announcement clusters (FIG 0/18 / 0/19)
+    std::vector<int> clusters;
+    for (int i = 0; i < f.n_svcs; i++)
+        for (int k = 0; k < f.svcs[i].n_clusters; k++)
+            if (std::find(clusters.begin(), clusters.end(), f.svcs[i].clusters[k]) == clusters.end())
+                clusters.push_back(f.svcs[i].clusters[k]);
+    std::sort(clusters.begin(), clusters.end());
+    std::string cl;
+    for (int c : clusters) {
+        const fic_cluster_t &k = f.clusters[c];
+        cl += (cl.empty() ? "" : ";  ") + std::to_string(c);
+        if (k.asw && f.fic_count - k.seen <= 84)
+            cl += ": " + announcementList(k.asw, false) + " on SubCh " + std::to_string(k.subch);
+    }
+    it.push_back({"Announcement clusters", clusters.empty() ? "none" : cl});
+    drawPairs("enspairs", it);
+
+    // which FIGs have been received, wrapped between entries
+    ImGui::Spacing();
+    ImGui::TextDisabled("FIGs received (count)");
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.9f);
+    const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    const float gap = ImGui::GetFontSize() * 1.1f;
+    bool any = false;
+    for (int t = 0; t < 8; t++)
+        for (int e = 0; e < 32; e++) {
+            if (!f.fig_count[t][e]) continue;
+            snprintf(b, sizeof(b), "%d/%d (%u)", t, e, f.fig_count[t][e]);
+            if (any) {
+                ImGui::SameLine(0, gap);
+                if (ImGui::GetCursorPosX() + ImGui::CalcTextSize(b).x > right) ImGui::NewLine();
+            }
+            ImGui::TextUnformatted(b);
+            any = true;
+        }
+    if (!any) ImGui::TextUnformatted("-");
+    ImGui::PopFont();
+    endPanel();
+}
+
+// One line per component: type, sub-channel and its place in the multiplex, user applications
+static std::string componentText(const fic_state_t &f, const fic_service_t &s, const fic_svc_comp_t &c)
+{
+    std::string t;
+    char b[160];
+    if (c.tmid == 0)
+        t = c.type == ASCTY_DABPLUS ? "DAB+ audio (HE-AAC)" : c.type == ASCTY_MP2 ? "DAB audio (MPEG Layer II)"
+                                                                                : "audio, ASCTy " + std::to_string(c.type);
+    else if (c.tmid == 1)
+        t = "stream data (" + dscTyName(c.type) + ")";
+    else if (c.tmid == 2)
+        t = "FIDC data (" + dscTyName(c.type) + "), FIDCId " + std::to_string(c.subch);
+    else {
+        const fic_packet_comp_t *p = packetComp(f, c.scid);
+        t = "packet data";
+        if (p) {
+            snprintf(b, sizeof(b), " (%s), SCId %d, packet address %d%s", dscTyName(p->dscty).c_str(), c.scid, p->address,
+                     p->dg ? ", no data groups" : "");
+            t += b;
+        } else {
+            t += ", SCId " + std::to_string(c.scid);
+        }
+    }
+    const int sc = compSubch(f, c);
+    if (sc >= 0) {
+        const fic_subch_t &x = f.subch[sc];
+        if (x.valid)
+            snprintf(b, sizeof(b), "\nSubCh %d   CUs %d-%d (%d)   %s   %d kbit/s", sc, x.start, x.start + x.size - 1, x.size,
+                     protectionText(x).c_str(), x.kbps);
+        else
+            snprintf(b, sizeof(b), "\nSubCh %d", sc);
+        t += b;
+        if (x.has_fec && x.fec) t += "   FEC (RS 204,188)";
+        if (x.has_lang && c.tmid != 3) t += "   " + language(x.lang);
+    }
+    if (c.tmid == 3)
+        for (int k = 0; k < f.n_comp_langs; k++)
+            if (f.comp_langs[k].scid == c.scid) t += "   " + language(f.comp_langs[k].lang);
+    if (c.ca) t += "   conditional access";
+
+    // user applications (FIG 0/13) of this component
+    const int scids = compScids(f, s, c);
+    std::vector<std::string> apps;
+    for (int k = 0; k < f.n_uas && scids >= 0; k++) {
+        if (f.uas[k].sid != s.sid || f.uas[k].scids != scids) continue;
+        const char *n = userAppName(f.uas[k].type);
+        apps.push_back(n ? n : "app 0x" + hex(f.uas[k].type, 3));
+    }
+    if (!apps.empty()) t += "\nApplications: " + joined(apps);
+    return t;
+}
+
+static void drawServiceDetails(App &a, const MuxInfo &m)
+{
+    const fic_state_t &f = m.fic;
+    beginPanel("svcdetails", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+    panelTitle("Services", "FIG 0/2, 0/3, 0/5, 0/8, 0/9, 0/13, 0/14, 0/17, 0/18, 1/1, 1/5");
+
+    // programme services first, then data services; each by label
+    std::vector<const fic_service_t *> list;
+    for (int i = 0; i < f.n_services; i++)
+        if (f.services[i].n_comps) list.push_back(&f.services[i]);
+    std::sort(list.begin(), list.end(), [](const fic_service_t *x, const fic_service_t *y) {
+        if (x->pd != y->pd) return !x->pd;
+        std::string lx = serviceName(*x), ly = serviceName(*y);
+        for (auto &c : lx) c = (char)tolower((unsigned char)c);
+        for (auto &c : ly) c = (char)tolower((unsigned char)c);
+        return lx != ly ? lx < ly : x->sid < y->sid;
+    });
+    if (list.empty()) ImGui::TextDisabled("Waiting for the service organisation (FIG 0/2)...");
+
+    const float fs = ImGui::GetFontSize();
+    for (const fic_service_t *sp : list) {
+        const fic_service_t &s = *sp;
+        const svc_info_t *info = nullptr;
+        for (int i = 0; i < f.n_svcs && !s.pd; i++)
+            if (f.svcs[i].sid == s.sid) info = &f.svcs[i];
+        ImGui::PushID(sp);
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // name, short label; SId, ECC and flag on the right
+        if (g_boldFont) ImGui::PushFont(g_boldFont, 0.0f);
+        ImGui::TextUnformatted(serviceName(s).c_str());
+        if (g_boldFont) ImGui::PopFont();
+        if (s.has_label && s.short_label[0]) {
+            ImGui::SameLine(0, fs * 0.6f);
+            ImGui::TextDisabled("%s", s.short_label);
+        }
+        const int ecc = info && info->has_ecc ? info->ecc : f.has_ecc ? f.ecc : -1;
+        std::string right = "SId " + hex(s.sid, s.pd ? 8 : 4);
+        if (ecc >= 0) right += "   ECC " + hex(ecc, 2);
+        const Country *country = ecc >= 0 && !s.pd ? dabCountry((uint8_t)ecc, (uint16_t)s.sid) : nullptr;
+        const FlagTexture *flag = country ? flagTexture(a, country->iso) : nullptr;
+        const float flagH = fs * 0.85f, flagW = flag ? flagH * flag->w / flag->h : 0;
+        const float rw = ImGui::CalcTextSize(right.c_str()).x + (flag ? flagW + fs * 0.4f : 0);
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - rw));
+        ImGui::TextDisabled("%s", right.c_str());
+        if (flag) {
+            ImGui::SameLine(0, fs * 0.4f);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetTextLineHeight() - flagH) * 0.5f);
+            ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)flag->tex), ImVec2(flagW, flagH));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", country->name);
+        }
+
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.9f);
+        ImGui::Indent(fs * 0.8f);
+        std::vector<std::pair<std::string, std::string>> it;
+        it.push_back({"Type", s.pd ? "data service" : "programme service"});
+        if (info && info->has_pty)
+            it.push_back({"Programme type", std::string(info->pty ? Player::ptyName(info->pty) : "none") +
+                                                (info->pty_dynamic ? " (dynamic)" : " (static)")});
+        if (country) it.push_back({"Country", country->name});
+        if (info && info->has_ecc) it.push_back({"Own ECC", hex(info->ecc, 2) + " (FIG 0/9 extended)"});
+        it.push_back({"Label charset", s.has_label ? charsetName(s.charset) : "-"});
+        it.push_back({"Local service", s.local ? "yes" : "no"});
+        if (s.caid) it.push_back({"Conditional access", "CAId " + std::to_string(s.caid)});
+        if (info && info->asu) {
+            std::string an = announcementList(info->asu, false);
+            std::vector<std::string> cs;
+            for (int k = 0; k < info->n_clusters; k++) cs.push_back(std::to_string(info->clusters[k]));
+            if (!cs.empty()) an += " (cluster " + joined(cs) + ")";
+            it.push_back({"Announcements", an});
+            int sub = -1;
+            const uint16_t active = fic_active_announcements(&f, info, &sub);
+            if (active) it.push_back({"Announcing now", announcementList(active, false) + " on SubCh " + std::to_string(sub)});
+        }
+        drawPairs("svcpairs", it);
+
+        for (int c = 0; c < s.n_comps; c++) {
+            const fic_svc_comp_t &comp = s.comps[c];
+            const int scids = compScids(f, s, comp);
+            char head[40];
+            if (comp.primary) snprintf(head, sizeof(head), "Primary component");
+            else if (scids >= 0) snprintf(head, sizeof(head), "Component %d", scids);
+            else snprintf(head, sizeof(head), "Secondary component");
+            ImGui::TextDisabled("%s", head);
+            ImGui::Indent(fs * 0.8f);
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextUnformatted(componentText(f, s, comp).c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Unindent(fs * 0.8f);
+        }
+        ImGui::Unindent(fs * 0.8f);
+        ImGui::PopFont();
+        ImGui::PopID();
+    }
+    endPanel();
+}
+
+static void muxInfoPopup(App &a)
+{
+    if (g_openMuxInfo) {
+        ImGui::OpenPopup("Ensemble information");
+        g_openMuxInfo = false;
+    }
+    const ImVec2 vs = ImGui::GetMainViewport()->Size;
+    ImGui::SetNextWindowSize(ImVec2(vs.x * 0.94f, vs.y * 0.92f));
+    ImGui::SetNextWindowPos(ImVec2(vs.x * 0.5f, vs.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    bool open = true;
+    if (!ImGui::BeginPopupModal("Ensemble information", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
+        return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    if (g_muxInfoScroll >= 0 && ImGui::GetScrollMaxY() > 0) {
+        ImGui::SetScrollY(g_muxInfoScroll);
+        g_muxInfoScroll = -1;
+    }
+    const std::shared_ptr<const MuxInfo> m = a.snap.mux;
+    if (!m) {
+        ImGui::TextDisabled("No multiplex information yet.");
+    } else {
+        drawCapacity(*m);
+        ImGui::Spacing();
+        drawEnsembleInfo(*m);
+        ImGui::Spacing();
+        drawServiceDetails(a, *m);
+    }
+    ImGui::EndPopup();
+}
+
 static void logPopup(App &a)
 {
     ImVec2 vs = ImGui::GetMainViewport()->Size;
@@ -1354,6 +2054,7 @@ static void drawStatus(App &a)
 //   EDIPLAYER_RATES=1                 keep the bitrate breakdown tooltip open
 //   EDIPLAYER_COPY=<sec>              copy the shown slide / logo to the clipboard after <sec>
 //   EDIPLAYER_SERVICE_TIP=<hex>       keep this service's list tooltip open
+//   EDIPLAYER_MUXINFO=<sec>[:<px>]    open the ensemble information after <sec>, scrolled down <px>
 
 static uint32_t crc32Png(const uint8_t *p, size_t n, uint32_t c = 0xFFFFFFFFu)
 {
@@ -1411,7 +2112,8 @@ static void writePng(const char *path, int w, int h, const std::vector<uint8_t> 
 
 struct TestHooks {
     std::vector<std::pair<double, std::string>> shots;
-    double exitAt = -1, recordAt = -1, copyAt = -1;
+    double exitAt = -1, recordAt = -1, copyAt = -1, muxInfoAt = -1;
+    float muxInfoScroll = -1;
     bool autostart = false;
     int sid = -1;
     void load(App &a)
@@ -1428,6 +2130,10 @@ struct TestHooks {
         if (const char *r = getenv("EDIPLAYER_RECORD")) recordAt = atof(r);
         g_forceRateTooltip = getenv("EDIPLAYER_RATES") != nullptr;
         if (const char *c = getenv("EDIPLAYER_COPY")) copyAt = atof(c);
+        if (const char *m = getenv("EDIPLAYER_MUXINFO")) {
+            muxInfoAt = atof(m);
+            if (const char *sc = strchr(m, ':')) muxInfoScroll = (float)atof(sc + 1);
+        }
         if (const char *t = getenv("EDIPLAYER_SERVICE_TIP")) g_forceServiceTip = (int)strtol(t, nullptr, 16);
         if (const char *u = getenv("EDIPLAYER_URL")) snprintf(a.url, sizeof(a.url), "%s", u);
         if (const char *s = getenv("EDIPLAYER_SID")) a.lastSid = (int)strtol(s, nullptr, 16);
@@ -1586,6 +2292,11 @@ int main(int, char **)
             copyShownImage(a);
             th.copyAt = -1;
         }
+        if (th.muxInfoAt >= 0 && now() - t0 >= th.muxInfoAt) {
+            g_openMuxInfo = true;
+            g_muxInfoScroll = th.muxInfoScroll * scale;
+            th.muxInfoAt = -1;
+        }
         if (th.recordAt >= 0 && now() - t0 >= th.recordAt) {
             std::string err;
             a.player.startRecording(Recorder::Raw, err);
@@ -1618,6 +2329,7 @@ int main(int, char **)
         drawNowPlaying(a);
         ImGui::EndChild();
         drawStatus(a);
+        muxInfoPopup(a);
         ImGui::End();
 
         ImGui::Render();

@@ -37,6 +37,7 @@ typedef struct {
     bool     has_label;
     uint8_t  pty;                    /* international programme type, FIG 0/17 */
     bool     has_pty;
+    bool     pty_dynamic;            /* S/D flag: the programme type follows the programme */
     uint8_t  ecc;                    /* service ECC if it differs from the ensemble's (FIG 0/9 ext.) */
     bool     has_ecc;
     uint16_t asu;                    /* announcement support flags, FIG 0/18 */
@@ -51,13 +52,53 @@ typedef struct {
     uint32_t seen;       /* fic_state_t.fic_count when last signalled */
 } fic_cluster_t;
 
-/* Sub-channel protection, FIG 0/1 */
+/* Sub-channel organisation, FIG 0/1 (+ FEC from FIG 0/14, language from FIG 0/5) */
 typedef struct {
-    bool    valid;
-    bool    eep;        /* long form: Equal Error Protection */
-    uint8_t level;      /* EEP 1..4, UEP 1..5 */
-    bool    eep_b;      /* EEP option 1 (profile B) */
+    bool     valid;
+    bool     eep;        /* long form: Equal Error Protection */
+    uint8_t  level;      /* EEP 1..4, UEP 1..5 */
+    bool     eep_b;      /* EEP option 1 (profile B) */
+    uint8_t  uep_index;  /* short form: UEP table index */
+    uint16_t start;      /* start address, CUs */
+    uint16_t size;       /* CUs */
+    uint16_t kbps;       /* bit rate given by the protection profile */
+    uint8_t  fec;        /* FIG 0/14 FEC scheme (packet mode) */
+    bool     has_fec;
+    uint8_t  lang;       /* FIG 0/5 (short form) */
+    bool     has_lang;
 } fic_subch_t;
+
+/* Service organisation, FIG 0/2, for programme and data services alike
+ * (data services have 32-bit SIds), with labels from FIG 1/1 and 1/5 */
+#define FIC_MAX_SVC_COMPS 12
+
+typedef struct {
+    uint8_t  tmid;       /* 0 stream audio, 1 stream data, 2 FIDC, 3 packet data */
+    uint8_t  type;       /* ASCTy (TMId 0) / DSCTy (TMId 1, 2) */
+    uint8_t  subch;      /* SubChId (TMId 0, 1), FIDCId (TMId 2) */
+    uint16_t scid;       /* service component id (TMId 3) */
+    bool     primary;
+    bool     ca;
+} fic_svc_comp_t;
+
+typedef struct {
+    uint32_t sid;
+    bool     pd;         /* data service */
+    bool     local;
+    uint8_t  caid;
+    uint8_t  n_comps;
+    fic_svc_comp_t comps[FIC_MAX_SVC_COMPS];
+    char     label[FIC_LABEL_MAX];
+    char     short_label[FIC_LABEL_MAX];
+    uint8_t  charset;
+    bool     has_label;
+} fic_service_t;
+
+/* FIG 0/5 long form: language of a packet mode component */
+typedef struct {
+    uint16_t scid;
+    uint8_t  lang;
+} fic_comp_lang_t;
 
 /*
  * Data components, for finding SPI (Service and Programme Information):
@@ -118,6 +159,37 @@ typedef struct {
     int                  n_uas;
     fic_primary_packet_t prim[FIC_MAX_COMPS];
     int                  n_prim;
+
+    /* for the ensemble information view */
+    fic_service_t   services[FIC_MAX_SVCS];  /* every service, in order of appearance */
+    int             n_services;
+    fic_comp_lang_t comp_langs[FIC_MAX_COMPS];
+    int             n_comp_langs;
+    char      ens_short_label[FIC_LABEL_MAX];
+    uint8_t   ens_charset;
+    /* FIG 0/0 */
+    bool      has_fig0_0;
+    uint8_t   change_flags;
+    bool      al_flag;                   /* alarm announcements permitted */
+    uint16_t  cif_count;                 /* 0..4999 */
+    uint8_t   occurrence_change;
+    bool      has_occurrence_change;
+    /* FIG 0/7 */
+    bool      has_fig0_7;
+    uint8_t   cfg_services;              /* number of services signalled */
+    uint16_t  reconfig_count;
+    /* FIG 0/9 */
+    int8_t    lto;                       /* local time offset, half hours */
+    uint8_t   inter_table_id;
+    /* FIG 0/10 */
+    bool      has_time;
+    uint32_t  mjd;
+    uint8_t   hour, minute, second;
+    uint16_t  ms;
+    bool      utc_long;                  /* seconds and milliseconds present */
+    bool      lsi;                       /* leap second indicator */
+    /* how often each FIG has been received: [type][extension] */
+    uint32_t  fig_count[8][32];
 } fic_state_t;
 
 /* A packet mode component carrying a user application */

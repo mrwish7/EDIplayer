@@ -92,6 +92,20 @@ int main(int argc, char **argv)
         if (!s.services.empty() && !s.ensemble.empty() && i >= 12) break;
     }
     printf("Ensemble 0x%04X \"%s\"  (%llu frames)\n", s.eid, s.ensemble.c_str(), (unsigned long long)s.afFrames);
+    if (s.mux) {
+        const MuxInfo &m = *s.mux;
+        printf("  EDI timestamp: %s  UTCO %d  seconds %u", m.atst ? "present" : "absent", m.utco, m.seconds);
+        if (m.atst && m.seconds) {
+            const time_t t = (time_t)946684800 + (time_t)m.seconds - m.utco;
+            char b[32];
+            strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", gmtime(&t));
+            printf(" = %s UTC", b);
+        }
+        printf("\n");
+        if (m.fic.has_time)
+            printf("  FIG 0/10: MJD %u %02d:%02d:%02d.%03d UTC\n", m.fic.mjd, m.fic.hour, m.fic.minute, m.fic.second,
+                   m.fic.ms);
+    }
     for (const auto &e : s.services)
         printf("  SId %04X  SCID %2d  %-5s %3d kbit/s  %-7s %-16s ECC %02X%s  ASu %04X  \"%s\"\n", e.sid, e.scid,
                e.dabplus ? "DAB+" : "DAB", e.kbps, e.protection.c_str(), e.pty >= 0 ? Player::ptyName(e.pty) : "?",
