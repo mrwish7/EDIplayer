@@ -93,9 +93,14 @@ size_t pad_process(void *opaque, const uint8_t *xpad_rev, size_t xpad_len,
     if (fpad_type != 0 || (xpad_ind != 1 && xpad_ind != 2))
         return 0;
 
-    /* X-PAD is transmitted in reverse byte order */
+    /* X-PAD is transmitted in reverse byte order, ending next to the F-PAD:
+     * if the space offered is larger than the buffer (MP2 at high bit rates
+     * passes the whole frame), keep the end of it */
     uint8_t xpad[PAD_MAX_XPAD];
-    if (xpad_len > sizeof(xpad)) xpad_len = sizeof(xpad);
+    if (xpad_len > sizeof(xpad)) {
+        xpad_rev += xpad_len - sizeof(xpad);
+        xpad_len = sizeof(xpad);
+    }
     for (size_t i = 0; i < xpad_len; i++)
         xpad[i] = xpad_rev[xpad_len - 1 - i];
 
