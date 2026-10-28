@@ -15,7 +15,9 @@ Runs on Windows and Linux (Dear ImGui + GLFW + OpenGL 3, miniaudio for sound).
    | `udp://239.1.2.3:5004` | join a multicast group |
    | `udp://239.1.2.3:5004?iface=192.168.1.10` | join on a specific interface |
 
-   Plain AF packets and PFT-fragmented (PF) packets are both accepted. The arrow next to the address opens the recent sources.
+   Plain AF packets and PFT-fragmented (PF) packets are both accepted.
+
+   **Favourites:** the star next to the address saves it as a favourite, with the ensemble's name as the label (edit it as you like); on a saved address the star is gold, and clicking it lets you rename or remove the favourite. The arrow lists the favourites: click one to switch to it, which also resumes the station you last played there. Hover a favourite and click × to remove it.
 2. The services appear on the left once the FIC has been received. Click one to play it. The ensemble header shows the EId and ECC, and the country's flag on the right. The country comes from the ECC plus the first hex digit of the EId (ETSI TS 101 756), and the European area and Australia are covered.
 3. On the right are the slideshow (320×240), the dynamic label and any DL Plus items (title, artist, ...). Hover the slide for its name and click-through URL. Right-click it to copy the image to the clipboard. On Linux this needs `xclip` (X11) or `wl-copy` (Wayland).
 
@@ -50,7 +52,7 @@ If the multiplex carries SPI (Service and Programme Information, ETSI TS 102 818
 
 All received files are saved to `EDIplayer_SPI/<ECC><EId>/` next to the program, e.g. `EDIplayer_SPI/E1CFCB/`. On Linux, if that folder isn't writable, they go under `~/.config/ediplayer/` instead. The folder also holds `logos.txt`, which records which logo belongs to which service, so the next time you connect to that ensemble the logos appear straight away.
 
-The source, volume, last service and recent sources are saved (`EDIplayer.ini` next to the exe on Windows, `~/.config/ediplayer/settings.ini` on Linux). On the next start the last service resumes automatically. **Log** shows what the receiver and decoders report.
+The source, volume, last service and favourites are saved (`EDIplayer.ini` next to the exe on Windows, `~/.config/ediplayer/settings.ini` on Linux). On the next start the last service resumes automatically. **Log** shows what the receiver and decoders report.
 
 ## Building
 

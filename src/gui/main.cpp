@@ -86,7 +86,11 @@ struct App {
     char url[256] = "";
     float volume = 0.8f;
     int lastSid = -1;
-    std::vector<std::string> recent;
+    struct Favourite {
+        std::string url, label;
+        int sid = -1;   // service last played from it
+    };
+    std::vector<Favourite> favourites;
 
     // runtime
     AudioOut audio;
@@ -176,7 +180,17 @@ static void loadSettings(App &a)
         if (k == "url") snprintf(a.url, sizeof(a.url), "%s", v.c_str());
         else if (k == "volume") a.volume = std::max(0.0f, std::min(1.0f, (float)atof(v.c_str())));
         else if (k == "sid") a.lastSid = v.empty() ? -1 : (int)strtol(v.c_str(), nullptr, 16);
-        else if (k == "recent" && !v.empty() && a.recent.size() < 10) a.recent.push_back(v);
+        else if (k == "favourite") {   // <url> TAB <label> [TAB <SId hex>]
+            std::vector<std::string> parts;
+            std::stringstream ss(v);
+            for (std::string p; std::getline(ss, p, '\t');) parts.push_back(p);
+            if (parts.empty() || parts[0].empty()) continue;
+            App::Favourite fav;
+            fav.url = parts[0];
+            fav.label = parts.size() > 1 && !parts[1].empty() ? parts[1] : parts[0];
+            if (parts.size() > 2 && !parts[2].empty()) fav.sid = (int)strtol(parts[2].c_str(), nullptr, 16);
+            a.favourites.push_back(fav);
+        }
     }
 }
 
@@ -187,14 +201,18 @@ static void saveSettings(const App &a)
     char sid[16] = "";
     if (a.lastSid >= 0) snprintf(sid, sizeof(sid), "%04X", a.lastSid);
     f << "url=" << a.url << "\n" << "volume=" << a.volume << "\n" << "sid=" << sid << "\n";
-    for (const auto &r : a.recent) f << "recent=" << r << "\n";
+    for (const auto &fav : a.favourites) {
+        char fsid[16] = "";
+        if (fav.sid >= 0) snprintf(fsid, sizeof(fsid), "%04X", fav.sid);
+        f << "favourite=" << fav.url << "\t" << fav.label << "\t" << fsid << "\n";
+    }
 }
 
-static void addRecent(App &a, const std::string &url)
+static App::Favourite *findFavourite(App &a, const std::string &url)
 {
-    a.recent.erase(std::remove(a.recent.begin(), a.recent.end(), url), a.recent.end());
-    a.recent.insert(a.recent.begin(), url);
-    if (a.recent.size() > 10) a.recent.resize(10);
+    for (auto &f : a.favourites)
+        if (f.url == url) return &f;
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +243,6 @@ static void startPlayer(App &a)
     a.message.clear();
     a.scrollToSelected = a.lastSid >= 0;
     a.selectedIndex = -1;
-    addRecent(a, a.url);
     saveSettings(a);
 }
 
@@ -238,6 +255,7 @@ static void stopPlayer(App &a)
 static void playService(App &a, int sid)
 {
     a.lastSid = sid;
+    if (App::Favourite *f = findFavourite(a, a.url)) f->sid = sid;
     a.player.select(sid);
     if (!a.player.running()) startPlayer(a);
     saveSettings(a);
@@ -575,6 +593,142 @@ static void drawPlayingBars(ImDrawList *dl, ImVec2 p, float h, float level, bool
 // ---------------------------------------------------------------------------
 // UI sections
 
+static void drawStar(ImDrawList *dl, ImVec2 c, float r, ImU32 colour, bool filled)
+{
+    const float pi = 3.14159265f;
+    ImVec2 pts[10];
+    for (int i = 0; i < 10; i++) {
+        const float ang = -pi * 0.5f + i * pi / 5, rr = i % 2 ? r * 0.45f : r;
+        pts[i] = ImVec2(c.x + cosf(ang) * rr, c.y + sinf(ang) * rr);
+    }
+    if (filled) dl->AddConcavePolyFilled(pts, 10, colour);
+    else dl->AddPolyline(pts, 10, colour, ImDrawFlags_Closed, 1.3f * ImGui::GetStyle().FontScaleDpi);
+}
+
+static std::string g_openSourcePopup;   // test hook EDIPLAYER_POPUP: "favourites" or "favedit"
+
+// Receive a favourite, resuming the service last played from it
+static void switchSource(App &a, const std::string &url)
+{
+    if (url != a.url) {
+        const App::Favourite *f = findFavourite(a, url);
+        a.lastSid = f ? f->sid : -1;
+    }
+    snprintf(a.url, sizeof(a.url), "%s", url.c_str());
+    if (a.player.running()) a.player.stop();
+    startPlayer(a);
+}
+
+// Star next to the address: outlined, or gold if the address is a favourite.
+// Opens a small editor for the favourite's label.
+static void drawFavouriteStar(App &a, float size)
+{
+    static char label[128] = "";
+    App::Favourite *fav = findFavourite(a, a.url);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::BeginDisabled(!a.url[0]);
+    const bool hook = g_openSourcePopup == "favedit";
+    if (ImGui::Button("##star", ImVec2(size, size)) || hook) {
+        if (hook) g_openSourcePopup.clear();
+        // the default label: the saved one, else the ensemble being received from this address
+        std::string def = fav ? fav->label : a.url;
+        if (!fav && a.player.running() && !a.snap.ensemble.empty()) def = a.snap.ensemble;
+        snprintf(label, sizeof(label), "%s", def.c_str());
+        ImGui::OpenPopup("favedit");
+    }
+    handCursor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(fav ? "Edit favourite" : "Save as favourite");
+    const ImVec2 anchor(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y + ImGui::GetStyle().ItemSpacing.y * 0.5f);
+    ImGui::EndDisabled();
+    const ImU32 gold = col(0.98f, 0.76f, 0.20f);
+    drawStar(ImGui::GetWindowDrawList(), ImVec2(p.x + size * 0.5f, p.y + size * 0.5f), size * 0.3f,
+             fav ? gold : ImGui::GetColorU32(a.url[0] ? ImGuiCol_Text : ImGuiCol_TextDisabled), fav != nullptr);
+
+    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));   // drops down from the star
+    if (!ImGui::BeginPopup("favedit")) return;
+    ImGui::TextDisabled(fav ? "Favourite" : "Save as favourite");
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+    const bool enter = ImGui::InputTextWithHint("##label", "Label", label, sizeof(label), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::TextDisabled("%s", a.url);
+    if (ImGui::Button(fav ? "Save" : "Add") || enter) {
+        const std::string l = label[0] ? label : a.url;
+        if (fav) fav->label = l;
+        else a.favourites.push_back({a.url, l, a.player.running() ? a.snap.selectedSid : -1});
+        saveSettings(a);
+        ImGui::CloseCurrentPopup();
+    }
+    handCursor();
+    if (fav) {
+        ImGui::SameLine();
+        if (ImGui::Button("Remove")) {
+            const std::string url = a.url;
+            a.favourites.erase(std::remove_if(a.favourites.begin(), a.favourites.end(),
+                                              [&](const App::Favourite &f) { return f.url == url; }),
+                               a.favourites.end());
+            saveSettings(a);
+            ImGui::CloseCurrentPopup();
+        }
+        handCursor();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    handCursor();
+    ImGui::EndPopup();
+}
+
+// The favourites dropdown: label and address on one line, x to remove on hover
+static void drawFavouritesList(App &a, ImVec2 anchor)
+{
+    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));   // drops down from the arrow
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 22, 0), ImVec2(FLT_MAX, FLT_MAX));
+    if (!ImGui::BeginPopup("favourites")) return;
+    if (a.favourites.empty()) {
+        ImGui::TextDisabled("No favourites yet.");
+        ImGui::TextDisabled("Use the star next to the address to save one.");
+    }
+    int remove = -1;
+    const float fs = ImGui::GetFontSize();
+    for (size_t i = 0; i < a.favourites.size(); i++) {
+        const App::Favourite &f = a.favourites[i];
+        ImGui::PushID((int)i);
+        const bool current = f.url == a.url;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float w = std::max(ImGui::GetContentRegionAvail().x, fs * 22);
+        const float xw = ImGui::GetFrameHeight();   // remove button
+        if (ImGui::Selectable("##fav", current, ImGuiSelectableFlags_AllowOverlap, ImVec2(w, 0))) {
+            if (!current || !a.player.running()) switchSource(a, f.url);
+        }
+        handCursor();
+        const bool hov = ImGui::IsItemHovered();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const float labelW = std::min(ImGui::CalcTextSize(f.label.c_str()).x, w * 0.55f);
+        dl->AddText(p, ImGui::GetColorU32(ImGuiCol_Text), fitText(f.label, w * 0.55f).c_str());
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.85f);
+        const float sfs = ImGui::GetFontSize();
+        dl->AddText(ImVec2(p.x + labelW + fs * 0.8f, p.y + (fs - sfs) * 0.75f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                    fitText(f.url, w - labelW - fs * 0.8f - xw).c_str());
+        ImGui::PopFont();
+        if (hov || ImGui::IsMouseHoveringRect(ImVec2(p.x + w - xw, p.y), ImVec2(p.x + w, p.y + fs))) {
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorScreenPos(ImVec2(p.x + w - xw, p.y));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+            if (ImGui::Button("x", ImVec2(xw, fs))) remove = (int)i;
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+            handCursor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove");
+        }
+        ImGui::PopID();
+    }
+    if (remove >= 0) {
+        a.favourites.erase(a.favourites.begin() + remove);
+        saveSettings(a);
+    }
+    ImGui::EndPopup();
+}
+
 static void drawSourceBar(App &a)
 {
     const ImGuiStyle &st = ImGui::GetStyle();
@@ -612,9 +766,9 @@ static void drawSourceBar(App &a)
     ImGui::TextUnformatted(stxt);
     ImGui::SetCursorScreenPos(ImVec2(p.x + pillW, p.y + (btn - fh) * 0.5f));
 
-    // URL + recent list
+    // URL, favourite star, favourites list
     ImGui::BeginDisabled(running);
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - fh - btn - st.ItemSpacing.x * 2);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - fh * 2 - btn - st.ItemSpacing.x * 3);
     bool enter = ImGui::InputTextWithHint("##url", "tcp://host:port   udp://239.1.2.3:5004   udp://5004", a.url,
                                           sizeof(a.url), ImGuiInputTextFlags_EnterReturnsTrue);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -623,19 +777,17 @@ static void drawSourceBar(App &a)
                           "  udp://port                 receive unicast UDP\n"
                           "  udp://group:port           join a multicast group\n"
                           "  udp://group:port?iface=ip  ... on a specific interface");
-    ImGui::SameLine();
-    if (ImGui::ArrowButton("##recent", ImGuiDir_Down)) ImGui::OpenPopup("recent");
-    handCursor();
-    if (ImGui::IsItemHovered() && !running) ImGui::SetTooltip("Recent sources");
     ImGui::EndDisabled();
-    if (ImGui::BeginPopup("recent")) {
-        if (a.recent.empty()) ImGui::TextDisabled("No recent sources");
-        for (const auto &r : a.recent) {
-            if (ImGui::Selectable(r.c_str())) snprintf(a.url, sizeof(a.url), "%s", r.c_str());
-            handCursor();
-        }
-        ImGui::EndPopup();
+    ImGui::SameLine();
+    drawFavouriteStar(a, fh);
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("##favourites", ImGuiDir_Down) || g_openSourcePopup == "favourites") {
+        g_openSourcePopup.clear();
+        ImGui::OpenPopup("favourites");
     }
+    handCursor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Favourites");
+    drawFavouritesList(a, ImVec2(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y + st.ItemSpacing.y * 0.5f));
 
     ImGui::SameLine();
     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, p.y));
@@ -2349,6 +2501,7 @@ static void drawStatus(App &a)
 //   EDIPLAYER_SERVICE_TIP=<hex>       keep this service's list tooltip open
 //   EDIPLAYER_MUXINFO=<sec>[:<px>]    open the ensemble information after <sec>, scrolled down <px>
 //   EDIPLAYER_EPG=<sec>               open the programme guide after <sec>
+//   EDIPLAYER_POPUP=<sec>:<name>      open the "favourites" list or the "favedit" editor after <sec>
 
 static uint32_t crc32Png(const uint8_t *p, size_t n, uint32_t c = 0xFFFFFFFFu)
 {
@@ -2406,7 +2559,8 @@ static void writePng(const char *path, int w, int h, const std::vector<uint8_t> 
 
 struct TestHooks {
     std::vector<std::pair<double, std::string>> shots;
-    double exitAt = -1, recordAt = -1, copyAt = -1, muxInfoAt = -1, epgAt = -1;
+    double exitAt = -1, recordAt = -1, copyAt = -1, muxInfoAt = -1, epgAt = -1, popupAt = -1;
+    std::string popup;
     float muxInfoScroll = -1;
     bool autostart = false;
     int sid = -1;
@@ -2425,6 +2579,10 @@ struct TestHooks {
         g_forceRateTooltip = getenv("EDIPLAYER_RATES") != nullptr;
         if (const char *c = getenv("EDIPLAYER_COPY")) copyAt = atof(c);
         if (const char *e = getenv("EDIPLAYER_EPG")) epgAt = atof(e);
+        if (const char *p = getenv("EDIPLAYER_POPUP")) {
+            popupAt = atof(p);
+            if (const char *c = strchr(p, ':')) popup = c + 1;
+        }
         if (const char *m = getenv("EDIPLAYER_MUXINFO")) {
             muxInfoAt = atof(m);
             if (const char *sc = strchr(m, ':')) muxInfoScroll = (float)atof(sc + 1);
@@ -2591,6 +2749,10 @@ int main(int, char **)
             g_openMuxInfo = true;
             g_muxInfoScroll = th.muxInfoScroll * scale;
             th.muxInfoAt = -1;
+        }
+        if (th.popupAt >= 0 && now() - t0 >= th.popupAt) {
+            g_openSourcePopup = th.popup;
+            th.popupAt = -1;
         }
         if (th.epgAt >= 0 && now() - t0 >= th.epgAt) {
             g_openEpg = true;
