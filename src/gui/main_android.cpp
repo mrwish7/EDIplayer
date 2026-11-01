@@ -40,6 +40,7 @@ static std::mutex g_mutex;
 static std::map<std::string, std::string> g_texts;   // confirmed text by field (platformTakeText)
 static int g_insets[4] = {0, 0, 0, 0};               // system bars + cutout, px: left, top, right, bottom
 static bool g_back = false;
+static std::vector<MediaCommand> g_commands;          // from the media controls (PlaybackService)
 
 static std::string fromBytes(JNIEnv *env, jbyteArray b)
 {
@@ -105,6 +106,33 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_mrwish7_ediplayer_MainActivity_
     std::lock_guard<std::mutex> lk(g_mutex);
     g_back = true;
     wakeLoop();
+}
+
+extern "C" JNIEXPORT void JNICALL Java_io_github_mrwish7_ediplayer_MainActivity_nativeMediaCommand(JNIEnv *, jclass, jint cmd)
+{
+    if (cmd < (int)MediaCommand::Play || cmd > (int)MediaCommand::Unmute) return;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_commands.push_back((MediaCommand)cmd);
+    wakeLoop();
+}
+
+// Tell the activity (and so PlaybackService) what is playing, when it changes
+static void sendMediaInfo(const MediaInfo &m)
+{
+    static MediaInfo sent;
+    if (m == sent) return;
+    jbyteArray st = toBytes(m.station.c_str()), ti = toBytes(m.title.c_str()), ar = toBytes(m.artist.c_str()),
+               al = toBytes(m.album.c_str());
+    jbyteArray art = nullptr;   // null: unchanged
+    if (m.artwork != sent.artwork) {
+        const jsize n = m.artwork ? (jsize)m.artwork->size() : 0;
+        art = g_env->NewByteArray(n);
+        if (n) g_env->SetByteArrayRegion(art, 0, n, (const jbyte *)m.artwork->data());
+    }
+    callActivity("updateMedia", "(ZZ[B[B[B[B[B)V", (jboolean)m.playing, (jboolean)m.multicast, st, ti, ar, al, art);
+    for (jbyteArray b : {st, ti, ar, al, art})
+        if (b) g_env->DeleteLocalRef(b);
+    sent = m;
 }
 
 void platformRequestText(const char *key, const char *title, const char *hint, const char *text)
@@ -302,8 +330,9 @@ void android_main(android_app *app)
     }
 
     while (!app->destroyRequested) {
-        // ~20 fps while there's a window (as on the desktop), else sleep until the next event
-        int timeout = g_gfx.ready ? (int)(appFrameInterval(*g_app) * 1000) : -1;
+        // ~20 fps while there's a window (as on the desktop); in the background
+        // once a second while playing (for the media controls), else sleep until the next event
+        int timeout = g_gfx.ready ? (int)(appFrameInterval(*g_app) * 1000) : g_app->player.running() ? 1000 : -1;
         for (;;) {
             android_poll_source *source = nullptr;
             const int r = ALooper_pollOnce(timeout, nullptr, nullptr, (void **)&source);
@@ -315,19 +344,24 @@ void android_main(android_app *app)
         if (app->destroyRequested) break;
 
         bool back;
+        std::vector<MediaCommand> commands;
         {
             std::lock_guard<std::mutex> lk(g_mutex);
             back = g_back;
             g_back = false;
+            commands.swap(g_commands);
         }
         // Back closes a popup, else sends the app to the background (it keeps playing)
         if (back && !(g_gfx.ready && appBack())) callActivity("goToBackground", "()V");
+        for (MediaCommand c : commands) appMediaCommand(*g_app, c);
         if (appQuitRequested()) ANativeActivity_finish(app->activity);
-        if (g_gfx.ready) drawFrame();
+        if (g_gfx.ready) drawFrame();   // which also refreshes g_app->snap
+        sendMediaInfo(appMediaInfo(*g_app, g_gfx.ready ? g_app->snap : g_app->player.snapshot()));
     }
 
     shutdownUi();
-    appShutdown(*g_app);   // the activity is gone: stop playing
+    appShutdown(*g_app);   // the activity is gone (e.g. swiped away from Recents): stop playing
+    sendMediaInfo(appMediaInfo(*g_app, g_app->player.snapshot()));
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         g_android = nullptr;

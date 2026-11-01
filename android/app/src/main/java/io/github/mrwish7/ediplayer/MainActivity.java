@@ -2,11 +2,19 @@ package io.github.mrwish7.ediplayer;
 
 import android.app.AlertDialog;
 import android.app.NativeActivity;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Insets;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.DisplayCutout;
 import android.view.View;
@@ -23,13 +31,17 @@ import java.nio.charset.StandardCharsets;
 /**
  * The app's activity: a NativeActivity running libediplayer.so (src/gui/main_android.cpp),
  * plus what native code can't do on its own: text entry, the clipboard, the system bar
- * insets and the Back gesture. Strings to and from native code are UTF-8 byte arrays.
+ * insets, the Back gesture, and passing what is playing on to PlaybackService. Strings to
+ * and from native code are UTF-8 byte arrays.
  */
 public class MainActivity extends NativeActivity {
     static {
         // NativeActivity loads it too, but this makes the native methods below resolvable
         System.loadLibrary("ediplayer");
     }
+
+    private boolean resumed;   // in front, so it may show dialogs
+    private Bitmap artwork;    // the last artwork from native code
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -76,6 +88,18 @@ public class MainActivity extends NativeActivity {
         nativeBack();
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        resumed = true;
+    }
+
+    @Override
+    protected void onPause() {
+        resumed = false;
+        super.onPause();
+    }
+
     // ---- called from native code (android_main's thread)
 
     /** Ask for a line of text; the result goes to nativeTextResult() unless cancelled. */
@@ -119,6 +143,53 @@ public class MainActivity extends NativeActivity {
         runOnUiThread(() -> moveTaskToBack(true));
     }
 
+    /** What is playing changed: pass it on to PlaybackService. art: null if unchanged. */
+    public void updateMedia(boolean playing, boolean multicast, byte[] station, byte[] title, byte[] artist,
+                            byte[] album, byte[] art) {
+        final Bitmap bitmap = art == null ? null : art.length > 0 ? BitmapFactory.decodeByteArray(art, 0, art.length) : null;
+        runOnUiThread(() -> {
+            PlaybackService.State s = new PlaybackService.State();
+            s.playing = playing;
+            s.multicast = multicast;
+            s.station = utf8(station);
+            s.title = utf8(title);
+            s.artist = utf8(artist);
+            s.album = utf8(album);
+            if (art != null) artwork = bitmap;
+            s.art = artwork;
+            PlaybackService.update(this, s);
+            if (playing && resumed) askBatteryOnce();
+        });
+    }
+
+    /**
+     * Once, the first time something plays: ask to be left out of battery optimisation,
+     * which on some phones stops playback in the background despite the foreground service.
+     */
+    private void askBatteryOnce() {
+        SharedPreferences prefs = getPreferences(MODE_PRIVATE);
+        if (prefs.getBoolean("batteryAsked", false)
+                || getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(getPackageName())) {
+            return;
+        }
+        prefs.edit().putBoolean("batteryAsked", true).apply();
+        new AlertDialog.Builder(this)
+                .setTitle("Playing in the background")
+                .setMessage("Some phones stop apps playing in the background to save battery. To keep "
+                        + "EDIplayer playing reliably with the screen off or while you use other apps, "
+                        + "allow it to run without battery restrictions.")
+                .setPositiveButton("Allow", (d, which) -> {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:" + getPackageName())));
+                    } catch (ActivityNotFoundException e) {
+                        startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                    }
+                })
+                .setNegativeButton("Not now", null)
+                .show();
+    }
+
     private static String utf8(byte[] b) {
         return new String(b, StandardCharsets.UTF_8);
     }
@@ -130,4 +201,6 @@ public class MainActivity extends NativeActivity {
     private static native void nativeTextResult(byte[] key, byte[] text);
     private static native void nativeInsets(int left, int top, int right, int bottom);
     private static native void nativeBack();
+    /** A PlaybackService.CMD_* command for the player */
+    static native void nativeMediaCommand(int cmd);
 }

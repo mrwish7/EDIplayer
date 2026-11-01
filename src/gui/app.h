@@ -67,7 +67,20 @@ struct App {
     std::string settingsPath;
     bool narrow = false;               // phone layout: one panel at a time
     enum Tab { TabNowPlaying, TabServices } tab = TabNowPlaying;
+    bool muted = false;                // MediaCommand::Mute (e.g. during a phone call)
 };
+
+// What the system's media controls show (Android: notification, lock screen)
+struct MediaInfo {
+    bool playing = false;              // receiving, with a service selected
+    bool multicast = false;            // the source is a multicast group
+    std::string station, title, artist, album;
+    SharedBytes artwork;               // the slide, else the station's SPI logo (image file)
+    bool operator==(const MediaInfo &) const = default;
+};
+
+// From the system's media controls; the values are shared with PlaybackService.java
+enum class MediaCommand { Play, Stop, Next, Previous, Mute, Unmute };
 
 // ---- called by the front end
 
@@ -93,6 +106,9 @@ bool appBack();
 void appReleaseGl(App &a);
 // Stop playing and save the settings
 void appShutdown(App &a);
+// Media controls: what is playing (from snapshot s), and their commands
+MediaInfo appMediaInfo(const App &a, const PlayerSnapshot &s);
+void appMediaCommand(App &a, MediaCommand c);
 
 // ---- implemented by the front end
 

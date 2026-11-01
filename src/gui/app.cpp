@@ -108,6 +108,7 @@ static void startPlayer(App &a)
 {
     if (a.player.running()) return;
     clearLogos(a);
+    if (a.muted) appMediaCommand(a, MediaCommand::Unmute);   // starting is a clear wish to hear it
     std::string err;
     a.player.select(a.lastSid);
     if (!a.player.start(a.url, err)) {
@@ -970,7 +971,7 @@ static void drawVolume(App &a, float width)
     int pct = (int)lroundf(a.volume * 100);
     char fmt[16];
     snprintf(fmt, sizeof(fmt), "Vol %d%%%%", pct);   // fmt is itself a format string
-    if (ImGui::SliderFloat("##vol", &a.volume, 0.0f, 1.0f, fmt)) a.audio.setVolume(a.volume);
+    if (ImGui::SliderFloat("##vol", &a.volume, 0.0f, 1.0f, fmt) && !a.muted) a.audio.setVolume(a.volume);
     if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings(a);
 }
 
@@ -2660,4 +2661,75 @@ void appShutdown(App &a)
 {
     a.player.stop();
     saveSettings(a);
+}
+
+MediaInfo appMediaInfo(const App &a, const PlayerSnapshot &s)
+{
+    MediaInfo m;
+    m.playing = a.player.running() && s.selectedSid >= 0;
+    if (!m.playing) return m;
+    EdiSourceUrl u;
+    std::string err;
+    m.multicast = EdiSourceUrl::parse(a.url, u, err) && !u.tcp && !u.host.empty();
+
+    char sidName[24];
+    snprintf(sidName, sizeof(sidName), "SId %04X", s.selectedSid);
+    const ServiceEntry *svc = nullptr;
+    for (const auto &e : s.services)
+        if (e.sid == s.selectedSid) svc = &e;
+    m.station = svc && !svc->label.empty() ? svc->label : sidName;
+    m.album = s.ensemble;
+    // title and artist from DL Plus while the item runs, else the dynamic label
+    if (s.itemRunning)
+        for (const auto &d : s.dlplus) {
+            if (d.type == 1) m.title = d.text;    // ITEM.TITLE
+            if (d.type == 4) m.artist = d.text;   // ITEM.ARTIST
+        }
+    if (m.title.empty()) m.title = !s.dls.empty() ? s.dls : m.station;
+    if (m.artist.empty()) m.artist = m.title == m.station ? s.ensemble : m.station;
+
+    if (s.slide) {
+        m.artwork = SharedBytes(s.slide, &s.slide->data);   // shares the slide's ownership
+    } else {
+        auto it = s.logos.find((uint16_t)s.selectedSid);
+        if (it != s.logos.end()) m.artwork = it->second.logo320 ? it->second.logo320 : it->second.logo32;
+    }
+    return m;
+}
+
+void appMediaCommand(App &a, MediaCommand c)
+{
+    switch (c) {
+    case MediaCommand::Play:
+        if (!a.player.running() && a.url[0]) startPlayer(a);
+        break;
+    case MediaCommand::Stop:
+        if (a.player.running()) stopPlayer(a);
+        break;
+    case MediaCommand::Next:
+    case MediaCommand::Previous: {
+        // the next / previous station in the list, wrapping round
+        const std::vector<ServiceEntry> list = a.player.snapshot().services;   // a.snap is only fresh while drawing
+        if (list.empty()) break;
+        int i = -1;
+        for (size_t k = 0; k < list.size(); k++)
+            if (list[k].sid == a.lastSid) i = (int)k;
+        const int n = (int)list.size();
+        i = i < 0 ? 0 : (i + (c == MediaCommand::Next ? 1 : n - 1)) % n;
+        a.scrollToSelected = true;
+        a.selectedIndex = -1;
+        playService(a, list[i].sid);
+        break;
+    }
+    case MediaCommand::Mute:
+        if (!a.muted) applog::add("audio: muted (another app has the audio, e.g. a phone call)");
+        a.muted = true;
+        a.audio.setVolume(0);
+        break;
+    case MediaCommand::Unmute:
+        if (a.muted) applog::add("audio: unmuted");
+        a.muted = false;
+        a.audio.setVolume(a.volume);
+        break;
+    }
 }
