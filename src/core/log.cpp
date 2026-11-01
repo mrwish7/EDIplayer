@@ -7,6 +7,10 @@
 #include <deque>
 #include <mutex>
 
+#ifdef __ANDROID__
+#include <android/log.h>   // an app's stderr goes nowhere: use logcat
+#endif
+
 namespace applog {
 
 static std::mutex g_mutex;
@@ -16,7 +20,11 @@ static const size_t kMaxLines = 1000;
 
 void add(const std::string &line)
 {
+#ifdef __ANDROID__
+    __android_log_write(ANDROID_LOG_INFO, "EDIplayer", line.c_str());
+#else
     std::fprintf(stderr, "%s\n", line.c_str());
+#endif
     std::lock_guard<std::mutex> lk(g_mutex);
     g_lines.push_back(line);
     g_total++;

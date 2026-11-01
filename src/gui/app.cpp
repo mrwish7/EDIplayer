@@ -1,31 +1,18 @@
 // EDIplayer - plays the services of a DAB multiplex received as EDI over
 // UDP or TCP, with Dynamic Label (DL Plus) and Slideshow (Dear ImGui).
 //
+// The user interface, shared by the desktop (main_glfw.cpp) and Android
+// (main_android.cpp) front ends.
+//
 // Layout: source bar on top, the services from the FIC on the left, and the
-// selected service's slideshow and dynamic label on the right.
+// selected service's slideshow and dynamic label on the right. Narrow windows
+// (phones) show one of the two at a time, switched by tabs at the bottom.
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>   // before GLFW, which would otherwise define APIENTRY itself
-#else
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
+#include "app.h"
 
-#include "imgui.h"
-#include "backends/imgui_impl_glfw.h"
-#include "backends/imgui_impl_opengl3.h"
-
-#include "core/audio_out.h"
 #include "core/countries.h"
 #include "core/log.h"
 #include "flags_data.h"
-#ifndef _WIN32
-#include "icon_data.h"   // Windows uses the .ico resource instead
-#endif
-#include "core/player.h"
-
-#include <GLFW/glfw3.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
@@ -36,11 +23,6 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"   // PNG for copying images to the clipboard
 
-#ifdef _WIN32
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3native.h>   // HWND for the clipboard
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -48,71 +30,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <sstream>
-#include <string>
-#include <vector>
-
-#ifndef GL_CLAMP_TO_EDGE
-#define GL_CLAMP_TO_EDGE 0x812F
-#endif
-
-// ---------------------------------------------------------------------------
-// Data
-
-struct SlideTexture {
-    GLuint tex = 0;
-    int w = 0, h = 0;
-    uint64_t version = 0;
-    std::shared_ptr<const Slide> slide;
-};
-
-struct LogoTextures {
-    SharedBytes smallSrc, largeSrc;    // what the textures were made from
-    GLuint logo32 = 0, logo320 = 0;
-    int largeW = 0, largeH = 0;
-};
-
-struct FlagTexture {
-    GLuint tex = 0;
-    int w = 0, h = 0;
-};
-
-struct App {
-    // settings
-    char url[256] = "";
-    float volume = 0.8f;
-    int lastSid = -1;
-    struct Favourite {
-        std::string url, label;
-        int sid = -1;   // service last played from it
-    };
-    std::vector<Favourite> favourites;
-
-    // runtime
-    AudioOut audio;
-    Player player{&audio};
-    PlayerSnapshot snap;
-    SlideTexture slide;
-    std::map<uint16_t, LogoTextures> logos;
-    uint64_t logosVersion = 0;
-    LogoTextures ensembleLogo;                  // logo32 / smallSrc only
-    std::map<std::string, FlagTexture> flags;   // by ISO code
-    std::string message;               // last start error
-    std::string toast;                 // short-lived status message
-    double toastTime = -100;
-    GLFWwindow *window = nullptr;
-    std::deque<std::string> log;
-    size_t logCounter = 0;
-    uint64_t lastBytes = 0;
-    double lastRateTime = 0, rxKbps = 0;
-    bool scrollToSelected = false;
-    int selectedIndex = -1;            // list row last scrolled to
-    std::string settingsPath;
-};
 
 static double now()
 {
@@ -122,52 +42,6 @@ static double now()
 
 // ---------------------------------------------------------------------------
 // Settings (key=value text file)
-
-static std::string executableDir()
-{
-#ifdef _WIN32
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    char u8[MAX_PATH * 3];
-    int m = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, u8, sizeof(u8), nullptr, nullptr);
-    std::string p(u8, m > 0 ? (size_t)m : 0);
-    size_t s = p.find_last_of("\\/");
-#else
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    std::string p = n > 0 ? std::string(buf, (size_t)n) : ".";
-    size_t s = p.rfind('/');
-#endif
-    return s == std::string::npos ? "." : p.substr(0, s);
-}
-
-// EDIplayer_SPI/ goes next to the program; on Linux fall back to the config
-// folder when the program is installed somewhere read-only
-static std::string spiBaseDir()
-{
-    std::string d = executableDir();
-#ifndef _WIN32
-    if (access(d.c_str(), W_OK) != 0) {
-        const char *xdg = getenv("XDG_CONFIG_HOME");
-        d = (xdg && *xdg ? std::string(xdg) : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.config") + "/ediplayer";
-    }
-#endif
-    return d;
-}
-
-static std::string settingsFile()
-{
-#ifdef _WIN32
-    // next to the executable, as dab2edi-gui does
-    return executableDir() + "\\EDIplayer.ini";
-#else
-    const char *xdg = getenv("XDG_CONFIG_HOME");
-    std::string dir = xdg && *xdg ? xdg : std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.config";
-    dir += "/ediplayer";
-    mkdir(dir.c_str(), 0755);
-    return dir + "/settings.ini";
-#endif
-}
 
 static void loadSettings(App &a)
 {
@@ -379,10 +253,8 @@ static const FlagTexture *flagTexture(App &a, const char *iso)
     return f.tex ? &f : nullptr;
 }
 
-// Put an image (JPEG/PNG/GIF/BMP file contents) on the system clipboard.
-// Windows: as a DIB (understood by every application) plus "PNG" (lossless,
-// keeps transparency). Linux: as image/png through wl-copy or xclip.
-static bool copyImageToClipboard(App &a, const std::vector<uint8_t> &file, std::string &err)
+// Put an image (JPEG/PNG/GIF/BMP file contents) on the system clipboard
+static bool copyImageToClipboard(const std::vector<uint8_t> &file, std::string &err)
 {
     int w, h, n;
     unsigned char *px = stbi_load_from_memory(file.data(), (int)file.size(), &w, &h, &n, 4);
@@ -399,60 +271,9 @@ static bool copyImageToClipboard(App &a, const std::vector<uint8_t> &file, std::
             v->insert(v->end(), (uint8_t *)data, (uint8_t *)data + size);
         }, &png, w, h, 4, px, w * 4);
     }
-#ifdef _WIN32
-    // CF_DIB: BITMAPINFOHEADER + bottom-up BGRX rows; transparency composited onto white
-    const size_t pixBytes = (size_t)w * h * 4;
-    HGLOBAL dib = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixBytes);
-    HGLOBAL pngMem = GlobalAlloc(GMEM_MOVEABLE, png.size());
-    bool ok = dib && pngMem;
-    if (ok) {
-        auto *bi = (BITMAPINFOHEADER *)GlobalLock(dib);
-        memset(bi, 0, sizeof(*bi));
-        bi->biSize = sizeof(*bi);
-        bi->biWidth = w;
-        bi->biHeight = h;   // positive: bottom-up
-        bi->biPlanes = 1;
-        bi->biBitCount = 32;
-        bi->biCompression = BI_RGB;
-        uint8_t *dst = (uint8_t *)(bi + 1);
-        for (int y = 0; y < h; y++) {
-            const uint8_t *s = px + (size_t)(h - 1 - y) * w * 4;
-            uint8_t *d = dst + (size_t)y * w * 4;
-            for (int x = 0; x < w; x++, s += 4, d += 4) {
-                const int al = s[3];
-                d[0] = (uint8_t)((s[2] * al + 255 * (255 - al)) / 255);
-                d[1] = (uint8_t)((s[1] * al + 255 * (255 - al)) / 255);
-                d[2] = (uint8_t)((s[0] * al + 255 * (255 - al)) / 255);
-                d[3] = 255;
-            }
-        }
-        GlobalUnlock(dib);
-        memcpy(GlobalLock(pngMem), png.data(), png.size());
-        GlobalUnlock(pngMem);
-        ok = OpenClipboard(glfwGetWin32Window(a.window)) != 0;
-    }
-    if (ok) {
-        EmptyClipboard();
-        ok = SetClipboardData(CF_DIB, dib) != nullptr;   // the clipboard owns it now
-        if (ok) dib = nullptr;
-        if (SetClipboardData(RegisterClipboardFormatA("PNG"), pngMem)) pngMem = nullptr;
-        CloseClipboard();
-    }
-    if (dib) GlobalFree(dib);
-    if (pngMem) GlobalFree(pngMem);
+    const bool ok = platformCopyImage(png, px, w, h, err);
     stbi_image_free(px);
-    if (!ok) err = "the clipboard is not available";
     return ok;
-#else
-    (void)a;
-    stbi_image_free(px);
-    const bool wayland = getenv("WAYLAND_DISPLAY") != nullptr;
-    FILE *p = popen(wayland ? "wl-copy --type image/png 2>/dev/null" : "xclip -selection clipboard -t image/png -i 2>/dev/null", "w");
-    bool ok = p && fwrite(png.data(), 1, png.size(), p) == png.size();
-    if (p && pclose(p) != 0) ok = false;
-    if (!ok) err = wayland ? "copying images needs wl-copy (package wl-clipboard)" : "copying images needs xclip";
-    return ok;
-#endif
 }
 
 static void showToast(App &a, const std::string &msg)
@@ -475,7 +296,7 @@ static void copyShownImage(App &a)
                                       : lt && lt->largeSrc ? lt->largeSrc.get() : nullptr;
     if (!img) return;
     std::string err;
-    if (copyImageToClipboard(a, *img, err)) showToast(a, "Image copied to the clipboard");
+    if (copyImageToClipboard(*img, err)) showToast(a, "Image copied to the clipboard");
     else showToast(a, "Copy failed: " + err);
 }
 
@@ -503,6 +324,17 @@ static void pollPlayer(App &a)
 // Drawing helpers
 
 static ImU32 col(float r, float g, float b, float al = 1.0f) { return ImGui::GetColorU32(ImVec4(r, g, b, al)); }
+
+// The rectangle the UI may use (the window, less any system bars on Android)
+static ImVec2 g_areaPos, g_areaSize;
+
+// Size the next popup to these fractions of the UI area, centred in it
+static void setNextPopupRect(float fx, float fy)
+{
+    ImGui::SetNextWindowSize(ImVec2(g_areaSize.x * fx, g_areaSize.y * fy));
+    ImGui::SetNextWindowPos(ImVec2(g_areaPos.x + g_areaSize.x * 0.5f, g_areaPos.y + g_areaSize.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+}
 static const ImVec4 kAccent(0.20f, 0.55f, 0.95f, 1.0f);
 static ImFont *g_boldFont = nullptr;   // loaded in loadFont(); nullptr if none was found
 
@@ -607,6 +439,32 @@ static void drawStar(ImDrawList *dl, ImVec2 c, float r, ImU32 colour, bool fille
 
 static std::string g_openSourcePopup;   // test hook EDIPLAYER_POPUP: "favourites" or "favedit"
 
+// Text field; true when the text is confirmed (Enter). On Android the
+// on-screen keyboard can't type into the GL view, so a tap opens the system's
+// text dialog (titled `title`) and its text arrives in a later frame.
+static bool textField(const char *id, const char *title, const char *hint, char *buf, size_t size)
+{
+#ifdef __ANDROID__
+    const ImGuiStyle &st = ImGui::GetStyle();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 sz(ImGui::CalcItemWidth(), ImGui::GetFrameHeight());
+    if (ImGui::InvisibleButton(id, sz)) platformRequestText(id, title, hint, buf);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + sz.x, p.y + sz.y),
+                      ImGui::GetColorU32(ImGui::IsItemActive() ? ImGuiCol_FrameBgActive : ImGuiCol_FrameBg), st.FrameRounding);
+    dl->AddText(ImVec2(p.x + st.FramePadding.x, p.y + st.FramePadding.y),
+                ImGui::GetColorU32(buf[0] ? ImGuiCol_Text : ImGuiCol_TextDisabled),
+                fitText(buf[0] ? buf : hint, sz.x - st.FramePadding.x * 2).c_str());
+    std::string text;
+    if (!platformTakeText(id, text)) return false;
+    snprintf(buf, size, "%s", text.c_str());
+    return true;
+#else
+    (void)title;
+    return ImGui::InputTextWithHint(id, hint, buf, size, ImGuiInputTextFlags_EnterReturnsTrue);
+#endif
+}
+
 // Receive a favourite, resuming the service last played from it
 static void switchSource(App &a, const std::string &url)
 {
@@ -646,10 +504,13 @@ static void drawFavouriteStar(App &a, float size)
 
     ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));   // drops down from the star
     if (!ImGui::BeginPopup("favedit")) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::TextDisabled(fav ? "Favourite" : "Save as favourite");
+#ifndef __ANDROID__
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+#endif
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
-    const bool enter = ImGui::InputTextWithHint("##label", "Label", label, sizeof(label), ImGuiInputTextFlags_EnterReturnsTrue);
+    const bool enter = textField("##label", "Favourite label", "Label", label, sizeof(label));
     ImGui::TextDisabled("%s", a.url);
     if (ImGui::Button(fav ? "Save" : "Add") || enter) {
         const std::string l = label[0] ? label : a.url;
@@ -683,6 +544,7 @@ static void drawFavouritesList(App &a, ImVec2 anchor)
     ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));   // drops down from the arrow
     ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 22, 0), ImVec2(FLT_MAX, FLT_MAX));
     if (!ImGui::BeginPopup("favourites")) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     if (a.favourites.empty()) {
         ImGui::TextDisabled("No favourites yet.");
         ImGui::TextDisabled("Use the star next to the address to save one.");
@@ -757,20 +619,22 @@ static void drawSourceBar(App &a)
             break;
         }
     }
-    const float pillW = ImGui::CalcTextSize("CONNECTING").x + fh;
-    ImVec2 p = ImGui::GetCursorScreenPos();
+    // narrow: just the dot, to leave room for the address (the status line says the rest)
     const float fs = ImGui::GetFontSize();
+    const float pillW = a.narrow ? fs * 1.2f : ImGui::CalcTextSize("CONNECTING").x + fh;
+    ImVec2 p = ImGui::GetCursorScreenPos();
     const float yOff = (btn - fs) * 0.5f;
     ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + fs * 0.35f, p.y + yOff + fs * 0.55f), fs * 0.3f, dot, 16);
-    ImGui::SetCursorScreenPos(ImVec2(p.x + fs * 0.9f, p.y + yOff));
-    ImGui::TextUnformatted(stxt);
+    if (!a.narrow) {
+        ImGui::SetCursorScreenPos(ImVec2(p.x + fs * 0.9f, p.y + yOff));
+        ImGui::TextUnformatted(stxt);
+    }
     ImGui::SetCursorScreenPos(ImVec2(p.x + pillW, p.y + (btn - fh) * 0.5f));
 
     // URL, favourite star, favourites list
     ImGui::BeginDisabled(running);
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - fh * 2 - btn - st.ItemSpacing.x * 3);
-    bool enter = ImGui::InputTextWithHint("##url", "tcp://host:port   udp://239.1.2.3:5004   udp://5004", a.url,
-                                          sizeof(a.url), ImGuiInputTextFlags_EnterReturnsTrue);
+    bool enter = textField("##url", "EDI source", "tcp://host:port   udp://239.1.2.3:5004   udp://5004", a.url, sizeof(a.url));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("EDI source\n"
                           "  tcp://host:port            connect to an EDI TCP server\n"
@@ -1022,6 +886,7 @@ static void drawServices(App &a, float width)
         if (ImGui::InvisibleButton("row", ImVec2(w, rowH))) {
             a.scrollToSelected = false;
             if (!sel) playService(a, e.sid);
+            a.tab = App::TabNowPlaying;   // phone layout: show what's playing
         }
         if (!sel) handCursor();
         const bool hov = ImGui::IsItemHovered();
@@ -1407,8 +1272,9 @@ static void drawNowPlaying(App &a)
     ImGui::Separator();
     ImGui::Spacing();
 
-    // slideshow, 320 x 240
-    const ImVec2 box(320 * scale, 240 * scale);
+    // slideshow, 320 x 240 (phone layout: the panel's width, 4:3)
+    const float boxW = a.narrow ? ImGui::GetContentRegionAvail().x : 320 * scale;
+    const ImVec2 box(boxW, boxW * 0.75f);
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p, ImVec2(p.x + box.x, p.y + box.y), col(0, 0, 0, 0.35f), 6.0f);
@@ -2140,9 +2006,7 @@ static void muxInfoPopup(App &a)
         ImGui::OpenPopup("Ensemble information");
         g_openMuxInfo = false;
     }
-    const ImVec2 vs = ImGui::GetMainViewport()->Size;
-    ImGui::SetNextWindowSize(ImVec2(vs.x * 0.94f, vs.y * 0.92f));
-    ImGui::SetNextWindowPos(ImVec2(vs.x * 0.5f, vs.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    setNextPopupRect(0.94f, 0.92f);
     bool open = true;
     if (!ImGui::BeginPopupModal("Ensemble information", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
         return;
@@ -2215,9 +2079,7 @@ static void epgPopup(App &a)
         day = localMidnight(nowT);
         scrollToNow = true;
     }
-    const ImVec2 vs = ImGui::GetMainViewport()->Size;
-    ImGui::SetNextWindowSize(ImVec2(vs.x * 0.96f, vs.y * 0.92f));
-    ImGui::SetNextWindowPos(ImVec2(vs.x * 0.5f, vs.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    setNextPopupRect(0.96f, 0.92f);
     bool open = true;
     if (!ImGui::BeginPopupModal("Programme guide", &open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) return;
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
@@ -2432,10 +2294,10 @@ static void epgPopup(App &a)
 
 static void logPopup(App &a)
 {
-    ImVec2 vs = ImGui::GetMainViewport()->Size;
-    ImGui::SetNextWindowSize(ImVec2(vs.x * 0.9f, vs.y * 0.8f));
+    setNextPopupRect(0.9f, 0.8f);
     if (!ImGui::BeginPopupModal("Log", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
         return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::BeginChild("logtext", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_HorizontalScrollbar);
     for (const auto &l : a.log) ImGui::TextUnformatted(l.c_str());
@@ -2595,7 +2457,7 @@ struct TestHooks {
 };
 
 // ---------------------------------------------------------------------------
-// Theme and fonts
+// Theme
 
 static void applyTheme(float scale)
 {
@@ -2643,180 +2505,159 @@ static void applyTheme(float scale)
     s.FontScaleDpi = scale;
 }
 
-static ImFont *addFirstFont(const char *const *candidates, size_t n)
+// ---------------------------------------------------------------------------
+// Main window
+
+// Phone layout: switches between the two panels, above the status line
+static float tabsHeight() { return ImGui::GetFrameHeight() * 1.3f; }
+
+static void drawTabs(App &a)
 {
-    ImGuiIO &io = ImGui::GetIO();
-    for (size_t i = 0; i < n; i++) {
-        FILE *t = fopen(candidates[i], "rb");
-        if (!t) continue;
-        fclose(t);
-        if (ImFont *f = io.Fonts->AddFontFromFileTTF(candidates[i])) return f;
+    static const char *const labels[2] = {"Now playing", "Services"};
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float w = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+    for (int i = 0; i < 2; i++) {
+        if (i) ImGui::SameLine(0, gap);
+        const bool sel = a.tab == i;
+        if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.35f));
+        if (ImGui::Button(labels[i], ImVec2(w, tabsHeight()))) a.tab = (App::Tab)i;
+        if (sel) ImGui::PopStyleColor();
     }
-    return nullptr;
 }
 
-static void loadFont()
+static TestHooks g_hooks;
+static double g_t0 = 0;
+static bool g_quit = false;
+
+void appInit(App &a, const std::string &settingsPath, const std::string &spiDir, const std::string &recordDir)
 {
-    static const char *regular[] = {
-#ifdef _WIN32
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-#else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-#endif
-    };
-    static const char *bold[] = {
-#ifdef _WIN32
-        "C:\\Windows\\Fonts\\segoeuib.ttf",
-        "C:\\Windows\\Fonts\\arialbd.ttf",
-#else
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-#endif
-    };
-    // the first font added is the default
-    if (!addFirstFont(regular, sizeof(regular) / sizeof(regular[0]))) ImGui::GetIO().Fonts->AddFontDefault();
-    g_boldFont = addFirstFont(bold, sizeof(bold) / sizeof(bold[0]));
+    a.settingsPath = settingsPath;
+    loadSettings(a);
+    a.audio.setVolume(a.volume);
+    a.player.setSpiBaseDir(spiDir);
+    a.player.setRecordBaseDir(recordDir);
+    g_hooks.load(a);
+    g_t0 = now();
+    if (g_hooks.autostart && a.url[0]) startPlayer(a);
+}
+
+void appSetupUi(float scale, ImFont *boldFont)
+{
+    ImGui::GetIO().IniFilename = nullptr;
+    applyTheme(scale);
+    g_boldFont = boldFont;
     ImGui::GetStyle().FontSizeBase = 16.0f;
 }
 
-// ---------------------------------------------------------------------------
-
-int main(int, char **)
+void appUpdate(App &a)
 {
-    App a;
-    a.settingsPath = settingsFile();
-    loadSettings(a);
-    a.audio.setVolume(a.volume);
-    a.player.setSpiBaseDir(spiBaseDir());
-    a.player.setRecordBaseDir(spiBaseDir());   // EDIplayer_audio/ next to EDIplayer_SPI/
-
-    if (!glfwInit()) return 1;
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    const float scale = ImGui_ImplGlfw_GetContentScaleForMonitor(glfwGetPrimaryMonitor());
-    GLFWwindow *win = glfwCreateWindow((int)(940 * scale), (int)(610 * scale), "EDIplayer", nullptr, nullptr);
-    if (!win) return 1;
-    glfwSetWindowSizeLimits(win, (int)(720 * scale), (int)(520 * scale), GLFW_DONT_CARE, GLFW_DONT_CARE);
-#ifndef _WIN32
-    // window icon (on Windows it comes from the GLFW_ICON resource)
-    {
-        std::vector<GLFWimage> icons;
-        for (const auto &ic : kIconPngs) {
-            GLFWimage im;
-            int n;
-            im.pixels = stbi_load_from_memory(ic.data, (int)ic.size, &im.width, &im.height, &n, 4);
-            if (im.pixels) icons.push_back(im);
-        }
-        if (!icons.empty()) glfwSetWindowIcon(win, (int)icons.size(), icons.data());
-        for (auto &im : icons) stbi_image_free(im.pixels);
+    TestHooks &th = g_hooks;
+    const double t = now() - g_t0;
+    if (th.exitAt >= 0 && t >= th.exitAt) g_quit = true;
+    if (th.copyAt >= 0 && t >= th.copyAt) {
+        copyShownImage(a);
+        th.copyAt = -1;
     }
-#endif
-    glfwMakeContextCurrent(win);
-    a.window = win;
-    glfwSwapInterval(1);
+    if (th.muxInfoAt >= 0 && t >= th.muxInfoAt) {
+        g_openMuxInfo = true;
+        g_muxInfoScroll = th.muxInfoScroll * ImGui::GetStyle().FontScaleDpi;
+        th.muxInfoAt = -1;
+    }
+    if (th.popupAt >= 0 && t >= th.popupAt) {
+        g_openSourcePopup = th.popup;
+        th.popupAt = -1;
+    }
+    if (th.epgAt >= 0 && t >= th.epgAt) {
+        g_openEpg = true;
+        th.epgAt = -1;
+    }
+    if (th.recordAt >= 0 && t >= th.recordAt) {
+        std::string err;
+        a.player.startRecording(Recorder::Raw, err);
+        a.player.startRecording(Recorder::Wav, err);
+        th.recordAt = -1;
+    }
+    pollPlayer(a);
+}
 
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    applyTheme(scale);
-    loadFont();
-    ImGui_ImplGlfw_InitForOpenGL(win, true);
-    ImGui_ImplOpenGL3_Init("#version 130");
+void appDraw(App &a, ImVec2 pos, ImVec2 size)
+{
+    const float scale = ImGui::GetStyle().FontScaleDpi;
+    g_areaPos = pos;
+    g_areaSize = size;
+    a.narrow = size.x < 720 * scale;   // the desktop window's minimum width
 
-    TestHooks th;
-    th.load(a);
-    const double t0 = now();
-    if (th.autostart && a.url[0]) startPlayer(a);
+    ImGui::SetNextWindowPos(pos);
+    ImGui::SetNextWindowSize(size);
+    ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                                  ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    drawSourceBar(a);
+    ImGui::Spacing();
 
-    while (!glfwWindowShouldClose(win)) {
-        if (th.exitAt >= 0 && now() - t0 >= th.exitAt) glfwSetWindowShouldClose(win, GLFW_TRUE);
-        if (th.copyAt >= 0 && now() - t0 >= th.copyAt) {
-            copyShownImage(a);
-            th.copyAt = -1;
-        }
-        if (th.muxInfoAt >= 0 && now() - t0 >= th.muxInfoAt) {
-            g_openMuxInfo = true;
-            g_muxInfoScroll = th.muxInfoScroll * scale;
-            th.muxInfoAt = -1;
-        }
-        if (th.popupAt >= 0 && now() - t0 >= th.popupAt) {
-            g_openSourcePopup = th.popup;
-            th.popupAt = -1;
-        }
-        if (th.epgAt >= 0 && now() - t0 >= th.epgAt) {
-            g_openEpg = true;
-            th.epgAt = -1;
-        }
-        if (th.recordAt >= 0 && now() - t0 >= th.recordAt) {
-            std::string err;
-            a.player.startRecording(Recorder::Raw, err);
-            a.player.startRecording(Recorder::Wav, err);
-            th.recordAt = -1;
-        }
-
-        // ~20 fps while playing (level meter, label updates), slower when idle
-        glfwWaitEventsTimeout(a.player.running() ? 0.05 : 0.25);
-        pollPlayer(a);
-
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
-        ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
-                                      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
-        drawSourceBar(a);
-        ImGui::Spacing();
-
-        // the two columns fill the space down to the status line
-        const float statusH = ImGui::GetFrameHeightWithSpacing();
+    // the panels fill the space down to the status line (and the tabs)
+    const float statusH = ImGui::GetFrameHeightWithSpacing();
+    if (!a.narrow) {
         ImGui::BeginChild("columns", ImVec2(0, -statusH), 0, ImGuiWindowFlags_NoBackground);
         const float listW = std::max(240 * scale, std::min(320 * scale, ImGui::GetContentRegionAvail().x * 0.32f));
         drawServices(a, listW);
         ImGui::SameLine();
         drawNowPlaying(a);
         ImGui::EndChild();
-        drawStatus(a);
-        muxInfoPopup(a);
-        epgPopup(a);
-        ImGui::End();
-
-        ImGui::Render();
-        int fw, fhh;
-        glfwGetFramebufferSize(win, &fw, &fhh);
-        glViewport(0, 0, fw, fhh);
-        glClearColor(0.086f, 0.094f, 0.114f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        if (!th.shots.empty() && now() - t0 >= th.shots.front().first) {
-            std::vector<uint8_t> px((size_t)fw * fhh * 4);
-            glReadPixels(0, 0, fw, fhh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-            writePng(th.shots.front().second.c_str(), fw, fhh, px);
-            th.shots.erase(th.shots.begin());
-        }
-        glfwSwapBuffers(win);
+    } else {
+        const float tabsH = tabsHeight() + ImGui::GetStyle().ItemSpacing.y;
+        ImGui::BeginChild("page", ImVec2(0, -(statusH + tabsH)), 0, ImGuiWindowFlags_NoBackground);
+        if (a.tab == App::TabServices) drawServices(a, 0);
+        else drawNowPlaying(a);
+        ImGui::EndChild();
+        drawTabs(a);
     }
+    drawStatus(a);
+    muxInfoPopup(a);
+    epgPopup(a);
+    ImGui::End();
+}
 
+void appAfterRender(App &, int fbWidth, int fbHeight)
+{
+    auto &shots = g_hooks.shots;
+    if (shots.empty() || now() - g_t0 < shots.front().first) return;
+    std::vector<uint8_t> px((size_t)fbWidth * fbHeight * 4);
+    glReadPixels(0, 0, fbWidth, fbHeight, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    writePng(shots.front().second.c_str(), fbWidth, fbHeight, px);
+    shots.erase(shots.begin());
+}
+
+double appFrameInterval(const App &a)
+{
+    // ~20 fps while playing (level meter, label updates), slower when idle
+    return a.player.running() ? 0.05 : 0.25;
+}
+
+bool appQuitRequested() { return g_quit; }
+
+bool appBack()
+{
+    if (!ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) return false;
+    // the popups close on Escape
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddKeyEvent(ImGuiKey_Escape, true);
+    io.AddKeyEvent(ImGuiKey_Escape, false);
+    return true;
+}
+
+void appReleaseGl(App &a)
+{
+    clearLogos(a);
+    if (a.slide.tex) glDeleteTextures(1, &a.slide.tex);
+    a.slide = SlideTexture();
+    for (auto &f : a.flags)
+        if (f.second.tex) glDeleteTextures(1, &f.second.tex);
+    a.flags.clear();
+}
+
+void appShutdown(App &a)
+{
     a.player.stop();
     saveSettings(a);
-    if (a.slide.tex) glDeleteTextures(1, &a.slide.tex);
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-    glfwDestroyWindow(win);
-    glfwTerminate();
-    return 0;
 }

@@ -68,10 +68,31 @@ if(WIN32)
 else()
   find_package(Threads REQUIRED)
   target_link_libraries(playercore PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
+  if(ANDROID)
+    target_link_libraries(playercore PUBLIC log)   # the log goes to logcat
+  endif()
 endif()
 
-# ---- GUI (Dear ImGui + GLFW + OpenGL 3) ----
-if(EDIPLAYER_BUILD_GUI)
+# ---- GUI (Dear ImGui; GLFW + OpenGL 3, or on Android NativeActivity + OpenGL ES 3) ----
+set(IMGUI_DIR third_party/imgui)
+set(IMGUI_SOURCES
+  ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp ${IMGUI_DIR}/imgui_widgets.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
+
+if(EDIPLAYER_BUILD_GUI AND ANDROID)
+  # libediplayer.so, loaded by the app's NativeActivity (see android/)
+  set(GLUE_DIR ${ANDROID_NDK}/sources/android/native_app_glue)
+  add_library(native_app_glue STATIC ${GLUE_DIR}/android_native_app_glue.c)
+  target_include_directories(native_app_glue PUBLIC ${GLUE_DIR})
+
+  add_library(ediplayer SHARED
+    src/gui/main_android.cpp src/gui/app.cpp
+    ${IMGUI_SOURCES} ${IMGUI_DIR}/backends/imgui_impl_android.cpp)
+  target_include_directories(ediplayer PRIVATE ${IMGUI_DIR} third_party/stb)
+  target_link_libraries(ediplayer PRIVATE playercore native_app_glue android EGL GLESv3 log)
+  # the glue's entry point, called by NativeActivity but by nothing in the library
+  target_link_options(ediplayer PRIVATE -u ANativeActivity_onCreate)
+elseif(EDIPLAYER_BUILD_GUI)
   set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
   set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -80,12 +101,9 @@ if(EDIPLAYER_BUILD_GUI)
   add_subdirectory(third_party/glfw EXCLUDE_FROM_ALL)
   find_package(OpenGL REQUIRED)
 
-  set(IMGUI_DIR third_party/imgui)
   add_executable(EDIplayer WIN32
-    src/gui/main.cpp
-    ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
-    ${IMGUI_DIR}/imgui_widgets.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
+    src/gui/main_glfw.cpp src/gui/app.cpp
+    ${IMGUI_SOURCES} ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp)
   target_include_directories(EDIplayer PRIVATE ${IMGUI_DIR} third_party/stb)
   target_link_libraries(EDIplayer PRIVATE playercore glfw OpenGL::GL)
   if(WIN32)

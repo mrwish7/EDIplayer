@@ -64,6 +64,8 @@ bool AudioOut::openDevice(int rate)
     cfg.dataCallback = dataCallback;
     cfg.pUserData = this;
     cfg.periodSizeInMilliseconds = 20;
+    cfg.aaudio.usage = ma_aaudio_usage_media;   // Android: music, for routing and volume
+    cfg.aaudio.contentType = ma_aaudio_content_type_music;
     ma_result r = ma_device_init(nullptr, &cfg, device_);
     if (r == MA_SUCCESS) r = ma_device_start(device_);
     if (r != MA_SUCCESS) {
