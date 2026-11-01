@@ -291,16 +291,38 @@ static const LogoTextures *findLogos(const App &a, int sid)
 }
 
 // Copy what the slideshow area shows: the slide, or else the station's 320x240 logo
-static void copyShownImage(App &a)
+static const std::vector<uint8_t> *shownImage(const App &a)
 {
     const LogoTextures *lt = a.snap.selectedSid >= 0 ? findLogos(a, a.snap.selectedSid) : nullptr;
-    const std::vector<uint8_t> *img = a.snap.slide ? &a.snap.slide->data
-                                      : lt && lt->largeSrc ? lt->largeSrc.get() : nullptr;
+    return a.snap.slide ? &a.snap.slide->data : lt && lt->largeSrc ? lt->largeSrc.get() : nullptr;
+}
+
+static void copyShownImage(App &a)
+{
+    const std::vector<uint8_t> *img = shownImage(a);
     if (!img) return;
     std::string err;
     if (copyImageToClipboard(*img, err)) showToast(a, "Image copied to the clipboard");
     else showToast(a, "Copy failed: " + err);
 }
+
+#ifdef __ANDROID__
+static const ServiceEntry *findService(const App &a, int sid);
+
+// Share or save the shown image, named after the station and the time
+static void shareShownImage(App &a, bool save)
+{
+    const std::vector<uint8_t> *img = shownImage(a);
+    if (!img) return;
+    const ServiceEntry *svc = findService(a, a.snap.selectedSid);
+    char ts[32];
+    const std::time_t t = std::time(nullptr);
+    std::tm tm;
+    localtime_r(&t, &tm);
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tm);
+    platformShareImage(*img, std::string(ts) + "_" + (svc && !svc->label.empty() ? svc->label : "EDIplayer"), save);
+}
+#endif
 
 static void pollPlayer(App &a)
 {
@@ -1179,6 +1201,12 @@ static float recorderWidth(const PlayerSnapshot &s)
     return pillWidth(t0) + ImGui::GetStyle().ItemSpacing.x * 0.6f + pillWidth(t1);
 }
 
+#ifdef __ANDROID__
+static const char *const kRecordFolder = "Download/EDIplayer";   // moved there when they stop
+#else
+static const char *const kRecordFolder = "EDIplayer_audio";
+#endif
+
 static void drawRecorder(App &a, const ServiceEntry *svc)
 {
     const PlayerSnapshot &s = a.snap;
@@ -1192,8 +1220,8 @@ static void drawRecorder(App &a, const ServiceEntry *svc)
         std::string tip;
         if (st.active) tip = "Recording to\n" + st.file + "\nClick to stop";
         else if (!can) tip = "Play a service to record it";
-        else if (i == 0) tip = std::string("Record the broadcast audio unchanged (") + rawExt + ") into EDIplayer_audio";
-        else tip = "Record the decoded audio as a WAV file into EDIplayer_audio";
+        else if (i == 0) tip = std::string("Record the broadcast audio unchanged (") + rawExt + ") into " + kRecordFolder;
+        else tip = std::string("Record the decoded audio as a WAV file into ") + kRecordFolder;
         if (i) {
             ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 0.6f);
             ImGui::SetCursorPosY(y);
@@ -1438,8 +1466,13 @@ static void drawNowPlaying(App &a)
             ImGui::TextDisabled("%s", info.c_str());
             ImGui::Separator();
         }
+#ifdef __ANDROID__
+        if (ImGui::MenuItem("Share image")) shareShownImage(a, false);
+        if (ImGui::MenuItem("Save to Pictures")) shareShownImage(a, true);
+#else
         if (ImGui::MenuItem("Copy image")) copyShownImage(a);
         handCursor();
+#endif
         ImGui::EndPopup();
     }
 

@@ -13,11 +13,13 @@ android {
         applicationId = "io.github.mrwish7.ediplayer"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        // from the release tag in CI (-PversionName=1.2.3 -PversionCode=10203)
+        versionCode = (findProperty("versionCode") as String?)?.toInt() ?: 1
+        versionName = findProperty("versionName") as String? ?: "dev"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")   // phones and tablets; the emulator
+            // phones and tablets (older 32-bit ones too); the emulator
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
         externalNativeBuild {
             cmake {
@@ -36,14 +38,28 @@ android {
 
     sourceSets {
         getByName("main") {
-            assets.srcDir("../../third_party/fonts")   // Noto Sans and its licence
+            assets.directories.add("../../third_party/fonts")   // Noto Sans and its licence
+        }
+    }
+
+    // The release key comes from the environment (CI secrets, see README); without it the
+    // release build is signed with the debug key, which can't update a properly signed install
+    val keystore = System.getenv("EDIPLAYER_KEYSTORE")
+    signingConfigs {
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("EDIPLAYER_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("EDIPLAYER_KEY_ALIAS")
+                keyPassword = System.getenv("EDIPLAYER_KEY_PASSWORD")
+            }
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")   // TODO: release key (phase 5)
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

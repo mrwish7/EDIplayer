@@ -35,6 +35,13 @@
             </intent-filter>
         </activity>
 
+        <!-- images shared from the slide menu -->
+        <provider
+            android:name=".ShareProvider"
+            android:authorities="${applicationId}.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <service
             android:name=".PlaybackService"
             android:exported="false"

@@ -4,11 +4,13 @@
 # the small text would only be noise there).
 #
 #   python3 tools/gen_icon.py        (needs Pillow and the Segoe UI or DejaVu fonts)
+#   python3 tools/gen_icon.py --android
 #
 # Writes res/icon.ico (Windows exe + window icon), res/icon_<size>.png, and
-# src/gui/icon_data.h (PNGs embedded for glfwSetWindowIcon on Linux).
+# src/gui/icon_data.h (PNGs embedded for glfwSetWindowIcon on Linux); with
+# --android only the Android adaptive icon layers.
 
-import io, os
+import io, os, sys
 from PIL import Image, ImageDraw, ImageFont
 
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -53,28 +55,54 @@ def draw_centered(d, text, font, cx, cy, fill):
     d.text((cx - (l + r) / 2, cy - (t + b) / 2), text, font=font, fill=fill)
 
 
+def draw_logo(d, S, ox=0, oy=0, small=False, mono=None):
+    """The EDI box and "player", for a tile S wide at (ox, oy); mono: one colour for all"""
+    bw, bh = (0.80, 0.52) if small else (0.74, 0.40)
+    top = 0.24 if small else 0.15
+    x0, y0 = ox + S * (1 - bw) / 2, oy + S * top
+    x1, y1 = x0 + S * bw, y0 + S * bh
+    stroke = S * (0.075 if small else 0.045)
+    d.rounded_rectangle([x0, y0, x1, y1], radius=S * 0.06, outline=mono or ACCENT, width=int(stroke))
+    edi = fit_font(BOLD, "EDI", (x1 - x0) - stroke * 3.2, (y1 - y0) - stroke * 3.2)
+    draw_centered(d, "EDI", edi, (x0 + x1) / 2, (y0 + y1) / 2, mono or WHITE)
+
+    if not small:
+        player = fit_font(SEMI, "player", S * 0.70, S * 0.17)
+        draw_centered(d, "player", player, ox + S / 2, oy + S * 0.745, mono or SUB)
+
+
 def render(size):
     S = size * 4                      # supersample, then downscale
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     m = S * 0.03
     d.rounded_rectangle([m, m, S - m, S - m], radius=S * 0.2, fill=BG, outline=EDGE, width=max(1, int(S * 0.012)))
-
-    small = size <= 32
-    bw, bh = (0.80, 0.52) if small else (0.74, 0.40)
-    top = 0.24 if small else 0.15
-    x0, y0 = S * (1 - bw) / 2, S * top
-    x1, y1 = x0 + S * bw, y0 + S * bh
-    stroke = S * (0.075 if small else 0.045)
-    d.rounded_rectangle([x0, y0, x1, y1], radius=S * 0.06, outline=ACCENT, width=int(stroke))
-    edi = fit_font(BOLD, "EDI", (x1 - x0) - stroke * 3.2, (y1 - y0) - stroke * 3.2)
-    draw_centered(d, "EDI", edi, (x0 + x1) / 2, (y0 + y1) / 2, WHITE)
-
-    if not small:
-        player = fit_font(SEMI, "player", S * 0.70, S * 0.17)
-        draw_centered(d, "player", player, S / 2, S * 0.745, SUB)
+    draw_logo(d, S, small=size <= 32)
     return img.resize((size, size), Image.LANCZOS)
 
+
+def render_android(px, mono=None):
+    """Adaptive icon foreground (or monochrome) layer: px square for 108 dp. The
+    tile's contents are drawn 62 dp wide, so the EDI box's corners stay inside
+    the 66 dp circle that launchers may crop to; the background is a colour."""
+    C = px * 4
+    img = Image.new("RGBA", (C, C), (0, 0, 0, 0))
+    T = C * 62 / 108
+    draw_logo(ImageDraw.Draw(img), T, (C - T) / 2, (C - T) / 2, mono=mono)
+    return img.resize((px, px), Image.LANCZOS)
+
+
+if "--android" in sys.argv:
+    # android/app/src/main/res: mipmap-<density>/ic_launcher_{foreground,monochrome}.png
+    # (the background is BG, in values/ic_launcher.xml)
+    andres = os.path.join(root, "android", "app", "src", "main", "res")
+    for dens, k in (("mdpi", 1), ("hdpi", 1.5), ("xhdpi", 2), ("xxhdpi", 3), ("xxxhdpi", 4)):
+        d = os.path.join(andres, "mipmap-" + dens)
+        os.makedirs(d, exist_ok=True)
+        render_android(int(108 * k)).save(os.path.join(d, "ic_launcher_foreground.png"), optimize=True)
+        render_android(int(108 * k), mono=WHITE).save(os.path.join(d, "ic_launcher_monochrome.png"), optimize=True)
+    print("Android icon layers written")
+    sys.exit(0)
 
 sizes = [16, 24, 32, 48, 64, 128, 256]
 imgs = {s: render(s) for s in sizes}

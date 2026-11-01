@@ -120,4 +120,7 @@ bool platformCopyImage(const std::vector<uint8_t> &png, const uint8_t *rgba, int
 // text the user confirmed (nothing if they cancelled)
 void platformRequestText(const char *key, const char *title, const char *hint, const char *text);
 bool platformTakeText(const char *key, std::string &text);
+// Share an image (image file contents) through the system's share sheet, or
+// save it to Pictures/EDIplayer; name: the file name without extension
+void platformShareImage(const std::vector<uint8_t> &file, const std::string &name, bool save);
 #endif

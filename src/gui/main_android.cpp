@@ -154,8 +154,35 @@ bool platformTakeText(const char *key, std::string &text)
 
 bool platformCopyImage(const std::vector<uint8_t> &, const uint8_t *, int, int, std::string &err)
 {
-    err = "copying images isn't available on Android yet";
+    err = "copying images isn't available on Android: use Share";   // the slide menu offers Share / Save instead
     return false;
+}
+
+void platformShareImage(const std::vector<uint8_t> &file, const std::string &name, bool save)
+{
+    jbyteArray data = g_env->NewByteArray((jsize)file.size());
+    g_env->SetByteArrayRegion(data, 0, (jsize)file.size(), (const jbyte *)file.data());
+    jbyteArray n = toBytes(name.c_str());
+    callActivity("shareImage", "([B[BZ)V", data, n, (jboolean)save);
+    g_env->DeleteLocalRef(data);
+    g_env->DeleteLocalRef(n);
+}
+
+// Recordings are written to the app's own folder; when one finishes, the
+// activity moves it to Download/EDIplayer, where the user can find it
+static void publishRecordings(const PlayerSnapshot &s)
+{
+    static std::string recording[2];   // file being recorded, by Recorder::Kind
+    for (int k = 0; k < 2; k++) {
+        if (s.rec[k].active) {
+            recording[k] = s.rec[k].file;
+        } else if (!recording[k].empty()) {
+            jbyteArray path = toBytes(recording[k].c_str());
+            callActivity("publishRecording", "([B)V", path);
+            g_env->DeleteLocalRef(path);
+            recording[k].clear();
+        }
+    }
 }
 
 static void setClipboardText(ImGuiContext *, const char *text)
@@ -356,12 +383,17 @@ void android_main(android_app *app)
         for (MediaCommand c : commands) appMediaCommand(*g_app, c);
         if (appQuitRequested()) ANativeActivity_finish(app->activity);
         if (g_gfx.ready) drawFrame();   // which also refreshes g_app->snap
-        sendMediaInfo(appMediaInfo(*g_app, g_gfx.ready ? g_app->snap : g_app->player.snapshot()));
+        PlayerSnapshot fresh;
+        const PlayerSnapshot &s = g_gfx.ready ? g_app->snap : (fresh = g_app->player.snapshot());
+        sendMediaInfo(appMediaInfo(*g_app, s));
+        publishRecordings(s);
     }
 
     shutdownUi();
     appShutdown(*g_app);   // the activity is gone (e.g. swiped away from Recents): stop playing
-    sendMediaInfo(appMediaInfo(*g_app, g_app->player.snapshot()));
+    const PlayerSnapshot s = g_app->player.snapshot();
+    sendMediaInfo(appMediaInfo(*g_app, s));
+    publishRecordings(s);
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         g_android = nullptr;

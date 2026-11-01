@@ -1,8 +1,8 @@
 # EDIplayer
 
-A desktop player for a full DAB multiplex received as **EDI** (ETSI TS 102 693) over UDP or TCP. It reads the service list from the FIC, plays any DAB+ or DAB (MP2) service, and shows that service's **Dynamic Label** (with **DL Plus** tags) and **MOT Slideshow**.
+A player for a full DAB multiplex received as **EDI** (ETSI TS 102 693) over UDP or TCP. It reads the service list from the FIC, plays any DAB+ or DAB (MP2) service, and shows that service's **Dynamic Label** (with **DL Plus** tags) and **MOT Slideshow**.
 
-Runs on Windows and Linux (Dear ImGui + GLFW + OpenGL 3, miniaudio for sound).
+Runs on Windows and Linux (Dear ImGui + GLFW + OpenGL 3, miniaudio for sound), and on Android 10 or later (see [Android](#android)).
 
 ## Using it
 
@@ -54,6 +54,17 @@ All received files are saved to `EDIplayer_SPI/<ECC><EId>/` next to the program,
 
 The source, volume, last service and favourites are saved (`EDIplayer.ini` next to the exe on Windows, `~/.config/ediplayer/settings.ini` on Linux). On the next start the last service resumes automatically. **Log** shows what the receiver and decoders report.
 
+### Android
+
+The Android app (`EDIplayer-android.apk` from the releases; allow your browser or file manager to install apps when asked) works like the desktop one, with these differences:
+
+- **Layout:** on a phone, *Now playing* and *Services* are two tabs at the bottom; choosing a station switches to *Now playing*. Tablets and other wide screens show both side by side, as on the desktop. Tapping the source address or a favourite's label opens a text box.
+- **Touch:** drag to scroll (with a fling). Where the desktop shows something on hover (service details, the bitrate breakdown, programme descriptions, ...), hold your finger on it; it stays until the next touch. Holding the slide opens its menu: **Share image** or **Save to Pictures** (in `Pictures/EDIplayer`).
+- **In the background:** playback continues with the screen off or another app in front. The notification and lock screen show the title and artist (DL Plus, else the dynamic label) with the slide or station logo, and have previous / next station (in list order), stop and play; headset and Bluetooth buttons work too. Pausing stops (it's live radio); unplugging headphones stops; a phone call mutes it until the call ends. **Back** goes to the background and keeps playing; swiping the app away from the recent apps stops it.
+- **Battery:** the first time something plays, the app offers to be left out of battery optimisation. Some phones stop background apps despite the notification, so allowing this is recommended.
+- **Multicast:** EDIplayer holds Android's multicast lock while receiving a multicast source, which many phones need in order to receive multicast on Wi-Fi at all.
+- **Files:** recordings are moved to `Download/EDIplayer` when they stop. SPI files and the settings are in the app's own storage.
+
 ## Building
 
 Everything is vendored in `third_party/`, so no downloads are needed. You need CMake ≥ 3.16 and a C++20 compiler.
@@ -74,12 +85,34 @@ cmake --build build-linux -j
 
 This builds `EDIplayer` and `edi-probe`.
 
-**GitHub Actions** (`.github/workflows/build.yml`) builds both platforms on every push, and the builds can be downloaded from the run's page. Pushing a version tag also publishes them as a release:
+**Android**: open `android/` in Android Studio, or build from the command line. You need JDK 17 or later (Android Studio's own will do: set `JAVA_HOME` to its `jbr` folder), and the Android SDK with **NDK 30.0.16248370** and **CMake 3.31.6** (Android Studio → SDK Manager → SDK Tools, with *Show Package Details*). Gradle builds the native part with the top-level `CMakeLists.txt`.
+
+```
+cd android
+gradlew assembleDebug        # app/build/outputs/apk/debug/app-debug.apk
+gradlew assembleRelease      # signed with the release key if it's set up (below), else the debug key
+```
+
+The engine alone can also be built with the NDK's CMake toolchain (`-DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DEDIPLAYER_BUILD_GUI=OFF`) and `edi-probe` run on a device with `adb shell`.
+
+**GitHub Actions** (`.github/workflows/build.yml`) builds all three on every push, and the builds can be downloaded from the run's page. Pushing a version tag also publishes them as a release (the tag sets the Android version: `v1.2.3` is version 1.2.3, code 10203):
 
 ```
 git tag v1.0.0
 git push origin v1.0.0
 ```
+
+**Android signing.** Android only installs an update over an existing copy if both are signed with the same key, so releases must always be signed with the same one. Create it once, keep a backup (if it is lost, users have to uninstall to install a newer version), and give it to GitHub as repository secrets:
+
+```
+keytool -genkeypair -v -keystore ediplayer-release.jks -alias ediplayer -keyalg RSA -keysize 4096 -validity 36500
+gh secret set ANDROID_KEYSTORE_BASE64 < <(base64 -w0 ediplayer-release.jks)
+gh secret set ANDROID_KEYSTORE_PASSWORD
+gh secret set ANDROID_KEY_ALIAS --body ediplayer
+gh secret set ANDROID_KEY_PASSWORD
+```
+
+Release tags fail without these secrets; other builds are then signed with a throwaway debug key. To sign a local release build, set `EDIPLAYER_KEYSTORE` (the `.jks` file), `EDIPLAYER_KEYSTORE_PASSWORD`, `EDIPLAYER_KEY_ALIAS` and `EDIPLAYER_KEY_PASSWORD`.
 
 ### edi-probe
 
@@ -110,8 +143,9 @@ EDI (UDP/TCP) ─► PFT reassembly ─► AF / TAG parsing (deti, est)
 | `src/edi/` | EDI/PFT/TAG parsing, FIC, DAB+ superframes, PAD, DLS, MOT, in C (from **edi-meta-forwarder**) |
 | `src/decoders/` | libfaad (HE-AAC v2) and libmad (Layer II) ports (from **UecpBridge**, with the UECP and MP3 parts removed) |
 | `src/core/` | network source, player engine, decoder wrappers, audio output, SPI (`spi.cpp`), log |
-| `src/gui/` | the Dear ImGui front end (style from **dab2edi**) |
-| `tools/` | `edi-probe`; `gen_icon.py` and `gen_flags.py` regenerate the embedded icon and flags |
+| `src/gui/` | the Dear ImGui user interface (`app.cpp`, style from **dab2edi**), and its front ends: `main_glfw.cpp` (Windows, Linux) and `main_android.cpp` |
+| `android/` | the Android app: Gradle project, manifest, and the Java side (activity, playback service with the media notification, image sharing) |
+| `tools/` | `edi-probe`; `gen_icon.py` and `gen_flags.py` regenerate the icons (also Android's, with `--android`) and the embedded flags |
 | `res/` | app icon (`icon.ico`, PNGs) and the Windows resource file |
 
 Changes to the reused code:
@@ -150,4 +184,4 @@ From there:
 
 ## Licences
 
-Third-party code: AbracaDABra's SPI binary tag tables (MIT, Petr Kopecký), country flags from flagcdn.com (public domain, embedded by `tools/gen_flags.py`), Dear ImGui (MIT), GLFW (zlib), miniaudio (public domain / MIT-0), stb_image (public domain / MIT), FAAD2 (GPL-2.0-or-later), libmad (GPL-2.0-or-later). Because of FAAD2 and libmad, the program as a whole is GPL.
+Third-party code: AbracaDABra's SPI binary tag tables (MIT, Petr Kopecký), country flags from flagcdn.com (public domain, embedded by `tools/gen_flags.py`), Dear ImGui (MIT), GLFW (zlib), miniaudio (public domain / MIT-0), stb_image (public domain / MIT), FAAD2 (GPL-2.0-or-later), libmad (GPL-2.0-or-later); in the Android app also Noto Sans (SIL Open Font License 1.1, `third_party/fonts/OFL.txt`) and the NDK's native_app_glue (Apache-2.0). Because of FAAD2 and libmad, the program as a whole is GPL.

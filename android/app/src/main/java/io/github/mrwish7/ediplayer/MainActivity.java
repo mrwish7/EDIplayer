@@ -5,6 +5,9 @@ import android.app.NativeActivity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
@@ -13,19 +16,33 @@ import android.graphics.Insets;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.InputType;
+import android.util.Log;
 import android.view.DisplayCutout;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
+import android.webkit.MimeTypeMap;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.Toast;
 import android.window.OnBackInvokedDispatcher;
 
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -35,6 +52,8 @@ import java.nio.charset.StandardCharsets;
  * and from native code are UTF-8 byte arrays.
  */
 public class MainActivity extends NativeActivity {
+    private static final String TAG = "EDIplayer";
+
     static {
         // NativeActivity loads it too, but this makes the native methods below resolvable
         System.loadLibrary("ediplayer");
@@ -80,6 +99,14 @@ public class MainActivity extends NativeActivity {
             getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                     OnBackInvokedDispatcher.PRIORITY_DEFAULT, MainActivity::nativeBack);
         }
+
+        // recordings left in the app's folder when it was closed while moving them
+        final File recordings = new File(getExternalFilesDir(null), "EDIplayer_audio");
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            File[] left = recordings.listFiles();
+            if (left != null) for (File f : left) moveToDownloads(app, f);
+        }).start();
     }
 
     @Override
@@ -141,6 +168,100 @@ public class MainActivity extends NativeActivity {
 
     public void goToBackground() {
         runOnUiThread(() -> moveTaskToBack(true));
+    }
+
+    /** Share an image (file contents) through the share sheet, or save it to Pictures/EDIplayer */
+    public void shareImage(byte[] data, byte[] name, boolean save) {
+        BitmapFactory.Options o = new BitmapFactory.Options();
+        o.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(data, 0, data.length, o);
+        final String type = o.outMimeType != null ? o.outMimeType : "image/jpeg";
+        final String file = utf8(name).replaceAll("[\\\\/:*?\"<>|]", "_") + "."
+                + MimeTypeMap.getSingleton().getExtensionFromMimeType(type);
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            try {
+                if (save) {
+                    saveToMediaStore(app, MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                            Environment.DIRECTORY_PICTURES + "/EDIplayer", file, type, new ByteArrayInputStream(data));
+                    toast(app, "Saved to Pictures/EDIplayer");
+                    return;
+                }
+                File dir = ShareProvider.dir(app);
+                File[] old = dir.listFiles();
+                if (old != null) for (File f : old) f.delete();   // keep only the latest
+                dir.mkdirs();
+                try (FileOutputStream out = new FileOutputStream(new File(dir, file))) {
+                    out.write(data);
+                }
+                Uri uri = ShareProvider.uriFor(app, file);
+                Intent send = new Intent(Intent.ACTION_SEND)
+                        .setType(type)
+                        .putExtra(Intent.EXTRA_STREAM, uri)
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                send.setClipData(ClipData.newRawUri(file, uri));   // the share sheet's preview
+                runOnUiThread(() -> startActivity(Intent.createChooser(send, null)));
+            } catch (IOException e) {
+                Log.w(TAG, "image: " + e);
+                toast(app, save ? "Cannot save the image" : "Cannot share the image");
+            }
+        }).start();
+    }
+
+    /** A recording has finished: move it from the app's folder to Download/EDIplayer */
+    public void publishRecording(byte[] path) {
+        final File f = new File(utf8(path));
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            if (moveToDownloads(app, f)) toast(app, "Recording saved to Download/EDIplayer");
+        }).start();
+    }
+
+    private static boolean moveToDownloads(Context context, File f) {
+        String name = f.getName();
+        String ext = name.substring(name.lastIndexOf('.') + 1).toLowerCase(java.util.Locale.ROOT);
+        String type = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+        try (InputStream in = new FileInputStream(f)) {
+            saveToMediaStore(context, MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    Environment.DIRECTORY_DOWNLOADS + "/EDIplayer", f.getName(),
+                    type != null ? type : "application/octet-stream", in);
+        } catch (IOException e) {
+            Log.w(TAG, "recording: cannot move " + f + " to Download: " + e);
+            return false;
+        }
+        f.delete();
+        return true;
+    }
+
+    /**
+     * Copy into a MediaStore collection, in a folder of the shared storage. The type must
+     * be the one Android maps the name's extension to, or it renames the file.
+     */
+    private static void saveToMediaStore(Context context, Uri collection, String folder, String name, String type,
+                                         InputStream in) throws IOException {
+        ContentResolver resolver = context.getContentResolver();
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+        v.put(MediaStore.MediaColumns.MIME_TYPE, type);
+        v.put(MediaStore.MediaColumns.RELATIVE_PATH, folder);
+        v.put(MediaStore.MediaColumns.IS_PENDING, 1);   // hidden until complete
+        Uri item = resolver.insert(collection, v);
+        if (item == null) throw new IOException("cannot create " + folder + "/" + name);
+        try (OutputStream out = resolver.openOutputStream(item)) {
+            if (out == null) throw new IOException("cannot write " + name);
+            byte[] buf = new byte[1 << 16];
+            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+        } catch (IOException e) {
+            resolver.delete(item, null, null);
+            throw e;
+        }
+        v.clear();
+        v.put(MediaStore.MediaColumns.IS_PENDING, 0);
+        resolver.update(item, v, null, null);
+    }
+
+    private static void toast(Context context, String text) {
+        new Handler(Looper.getMainLooper()).post(() -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show());
     }
 
     /** What is playing changed: pass it on to PlaybackService. art: null if unchanged. */
