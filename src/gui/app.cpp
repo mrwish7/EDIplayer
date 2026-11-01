@@ -9,6 +9,7 @@
 // (phones) show one of the two at a time, switched by tabs at the bottom.
 
 #include "app.h"
+#include "imgui_internal.h"   // touch scrolling: windows, scroll, active item
 
 #include "core/countries.h"
 #include "core/log.h"
@@ -328,6 +329,7 @@ static ImU32 col(float r, float g, float b, float al = 1.0f) { return ImGui::Get
 
 // The rectangle the UI may use (the window, less any system bars on Android)
 static ImVec2 g_areaPos, g_areaSize;
+static bool g_narrow = false;   // App::narrow, for the popups
 
 // Size the next popup to these fractions of the UI area, centred in it
 static void setNextPopupRect(float fx, float fy)
@@ -336,6 +338,113 @@ static void setNextPopupRect(float fx, float fy)
     ImGui::SetNextWindowPos(ImVec2(g_areaPos.x + g_areaSize.x * 0.5f, g_areaPos.y + g_areaSize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
 }
+
+// ---------------------------------------------------------------------------
+// Touch screens (Android). Nothing hovers: a long press opens an item's
+// tooltip, which stays until the next touch, and dragging scrolls the panel
+// the finger went down on (with a fling), instead of pressing what's under it.
+
+#ifdef __ANDROID__
+static const bool kTouch = true;
+#else
+static const bool kTouch = false;
+#endif
+static const float kLongPress = 0.45f;   // seconds
+
+static bool g_touchMoved = false;    // this touch scrolled: not a tap
+static bool g_touchLong = false;     // this touch was a long press: not a tap
+static ImGuiID g_tipId = 0;          // the area whose tooltip a long press opened
+static bool g_sliderActive = false;  // a slider owns the drag (set while drawing)
+static ImGuiID g_dragWindow = 0;     // the window being dragged / flung
+static ImVec2 g_flingVel;            // px/s after the finger lifts
+
+// Once per frame, before drawing
+static void touchUpdate()
+{
+    if (!kTouch) return;
+    ImGuiContext &g = *ImGui::GetCurrentContext();
+    const ImGuiIO &io = g.IO;
+    if (ImGui::IsMouseClicked(0)) {   // finger down: a new gesture
+        g_touchMoved = g_touchLong = false;
+        g_tipId = 0;
+        g_flingVel = ImVec2(0, 0);
+        g_dragWindow = g.HoveredWindow ? g.HoveredWindow->ID : 0;
+    }
+    ImGuiWindow *w = g_dragWindow ? ImGui::FindWindowByID(g_dragWindow) : nullptr;
+    // the window itself, or the nearest one around it that can scroll
+    while (w && w->ScrollMax.x <= 0 && w->ScrollMax.y <= 0 && (w->Flags & ImGuiWindowFlags_ChildWindow)) w = w->ParentWindow;
+    if (!w || (w->ScrollMax.x <= 0 && w->ScrollMax.y <= 0)) {
+        g_flingVel = ImVec2(0, 0);
+        return;
+    }
+    if (ImGui::IsMouseDown(0)) {
+        const bool scrollbar = g.ActiveId && (g.ActiveId == ImGui::GetWindowScrollbarID(w, ImGuiAxis_X) ||
+                                              g.ActiveId == ImGui::GetWindowScrollbarID(w, ImGuiAxis_Y));
+        if (g_sliderActive || scrollbar || g_touchLong || !ImGui::IsMouseDragging(0)) return;
+        // the first time, the whole way from where the finger went down
+        const ImVec2 d = g_touchMoved ? io.MouseDelta : ImGui::GetMouseDragDelta(0, 0.0f);
+        if (!g_touchMoved) {
+            g_touchMoved = true;
+            ImGui::ClearActiveID();   // a drag, so not a press of the item under the finger
+        }
+        ImGui::SetScrollX(w, w->Scroll.x - d.x);
+        ImGui::SetScrollY(w, w->Scroll.y - d.y);
+        if (io.DeltaTime > 0) {   // smoothed, for the fling
+            g_flingVel.x = g_flingVel.x * 0.6f + d.x / io.DeltaTime * 0.4f;
+            g_flingVel.y = g_flingVel.y * 0.6f + d.y / io.DeltaTime * 0.4f;
+        }
+    } else if (g_flingVel.x != 0 || g_flingVel.y != 0) {
+        ImGui::SetScrollX(w, w->Scroll.x - g_flingVel.x * io.DeltaTime);
+        ImGui::SetScrollY(w, w->Scroll.y - g_flingVel.y * io.DeltaTime);
+        const float k = expf(-io.DeltaTime * 3.0f);
+        g_flingVel = ImVec2(g_flingVel.x * k, g_flingVel.y * k);
+        if (fabsf(g_flingVel.x) + fabsf(g_flingVel.y) < 30 * ImGui::GetStyle().FontScaleDpi) g_flingVel = ImVec2(0, 0);
+    }
+}
+
+// Touch: a long press on the last item (or the area r0-r1, if given). Once per touch.
+static bool longPressed(ImVec2 r0 = ImVec2(0, 0), ImVec2 r1 = ImVec2(0, 0))
+{
+    if (!kTouch || g_touchLong || g_touchMoved || !ImGui::IsMouseDown(0) ||
+        ImGui::GetIO().MouseDownDuration[0] < kLongPress)
+        return false;
+    const bool area = r1.x > r0.x;
+    if (area ? !ImGui::IsMouseHoveringRect(r0, r1) : !ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) return false;
+    g_touchLong = true;
+    ImGui::ClearActiveID();   // not also a tap when the finger lifts
+    return true;
+}
+
+// Touch: a tap (press and release without moving or a long press) in r0-r1,
+// for areas drawn without an item
+static bool tapped(ImVec2 r0, ImVec2 r1)
+{
+    return ImGui::IsMouseReleased(0) && !g_touchMoved && !g_touchLong && ImGui::IsMouseHoveringRect(r0, r1);
+}
+
+// Whether to show the tooltip for the area r0-r1: while it's hovered with a
+// mouse; on a touch screen from a long press on it until the next touch,
+// placed beside it (not under the finger)
+static bool wantTip(ImVec2 r0, ImVec2 r1, bool hovered)
+{
+    if (!kTouch) return hovered;
+    const ImGuiID id = ImHashData(&r0, sizeof(r0), ImHashData(&r1, sizeof(r1)));
+    if (hovered && longPressed(r0, r1)) g_tipId = id;
+    if (g_tipId != id) return false;
+    const bool below = (r0.y + r1.y) * 0.5f < g_areaPos.y + g_areaSize.y * 0.5f;
+    const bool right = (r0.x + r1.x) * 0.5f > g_areaPos.x + g_areaSize.x * 0.5f;
+    const float gap = ImGui::GetStyle().ItemSpacing.y;
+    ImGui::SetNextWindowPos(ImVec2(right ? r1.x : r0.x, below ? r1.y + gap : r0.y - gap), ImGuiCond_Always,
+                            ImVec2(right ? 1.0f : 0.0f, below ? 0.0f : 1.0f));
+    return true;
+}
+
+// wantTip() for the last item
+static bool itemTip(ImGuiHoveredFlags flags = 0)
+{
+    return wantTip(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemHovered(flags));
+}
+
 static const ImVec4 kAccent(0.20f, 0.55f, 0.95f, 1.0f);
 static ImFont *g_boldFont = nullptr;   // loaded in loadFont(); nullptr if none was found
 
@@ -372,7 +481,7 @@ static bool iconButton(const char *id, Icon icon, float size, ImU32 bg, ImU32 fg
         const float s = size * 0.18f;
         dl->AddRectFilled(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), fg, s * 0.25f);
     }
-    if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tip);
+    if (tip && itemTip(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tip);
     return pressed;
 }
 
@@ -496,7 +605,7 @@ static void drawFavouriteStar(App &a, float size)
         ImGui::OpenPopup("favedit");
     }
     handCursor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(fav ? "Edit favourite" : "Save as favourite");
+    if (itemTip()) ImGui::SetTooltip(fav ? "Edit favourite" : "Save as favourite");
     const ImVec2 anchor(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y + ImGui::GetStyle().ItemSpacing.y * 0.5f);
     ImGui::EndDisabled();
     const ImU32 gold = col(0.98f, 0.76f, 0.20f);
@@ -572,7 +681,8 @@ static void drawFavouritesList(App &a, ImVec2 anchor)
         dl->AddText(ImVec2(p.x + labelW + fs * 0.8f, p.y + (fs - sfs) * 0.75f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
                     fitText(f.url, w - labelW - fs * 0.8f - xw).c_str());
         ImGui::PopFont();
-        if (hov || ImGui::IsMouseHoveringRect(ImVec2(p.x + w - xw, p.y), ImVec2(p.x + w, p.y + fs))) {
+        // the remove button: on hover, or always on a touch screen
+        if (kTouch || hov || ImGui::IsMouseHoveringRect(ImVec2(p.x + w - xw, p.y), ImVec2(p.x + w, p.y + fs))) {
             ImGui::SameLine(0, 0);
             ImGui::SetCursorScreenPos(ImVec2(p.x + w - xw, p.y));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
@@ -581,7 +691,7 @@ static void drawFavouritesList(App &a, ImVec2 anchor)
             ImGui::PopStyleVar();
             ImGui::PopStyleColor();
             handCursor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove");
+            if (itemTip()) ImGui::SetTooltip("Remove");
         }
         ImGui::PopID();
     }
@@ -636,7 +746,7 @@ static void drawSourceBar(App &a)
     ImGui::BeginDisabled(running);
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - fh * 2 - btn - st.ItemSpacing.x * 3);
     bool enter = textField("##url", "EDI source", "tcp://host:port   udp://239.1.2.3:5004   udp://5004", a.url, sizeof(a.url));
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    if (itemTip(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("EDI source\n"
                           "  tcp://host:port            connect to an EDI TCP server\n"
                           "  udp://port                 receive unicast UDP\n"
@@ -651,7 +761,7 @@ static void drawSourceBar(App &a)
         ImGui::OpenPopup("favourites");
     }
     handCursor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Favourites");
+    if (itemTip()) ImGui::SetTooltip("Favourites");
     drawFavouritesList(a, ImVec2(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y + st.ItemSpacing.y * 0.5f));
 
     ImGui::SameLine();
@@ -688,7 +798,9 @@ static float g_muxInfoScroll = -1;   // test hook: scroll the ensemble informati
 static bool infoButton(ImVec2 p, float sz, const char *tip)
 {
     const ImVec2 q(p.x + sz, p.y + sz), c(p.x + sz * 0.5f, p.y + sz * 0.5f);
-    const bool hov = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(p, q);
+    const float pad = kTouch ? sz * 0.5f : 0;   // a finger needs a larger target than drawn
+    const ImVec2 h0(p.x - pad, p.y - pad), h1(q.x + pad, q.y + pad);
+    const bool hov = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(h0, h1);
     ImDrawList *dl = ImGui::GetWindowDrawList();
     const ImU32 fg = ImGui::GetColorU32(hov ? ImGuiCol_Text : ImGuiCol_TextDisabled);
     if (hov) dl->AddCircleFilled(c, sz * 0.5f, ImGui::GetColorU32(ImGuiCol_ButtonHovered), 24);
@@ -697,10 +809,10 @@ static bool infoButton(ImVec2 p, float sz, const char *tip)
     const float ts = sz * 0.78f;
     const ImVec2 tsz = f->CalcTextSizeA(ts, FLT_MAX, 0, "i");
     dl->AddText(f, ts, ImVec2(c.x - tsz.x * 0.5f, c.y - tsz.y * 0.5f), fg, "i");
+    if (wantTip(h0, h1, hov)) ImGui::SetTooltip("%s", tip);
     if (!hov) return false;
     ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    ImGui::SetTooltip("%s", tip);
-    return ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    return kTouch ? tapped(h0, h1) : ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 }
 
 // Service list tooltip: identity (with the service's own country), format, PTY, announcements
@@ -746,9 +858,9 @@ static bool g_openEpg = false;   // set by the EPG button, opened at the main wi
 static bool epgButton()
 {
     ImFont *f = g_boldFont ? g_boldFont : ImGui::GetFont();
-    const float ts = ImGui::GetFontSize() * 0.72f;
+    const float ts = ImGui::GetFontSize() * (kTouch ? 0.85f : 0.72f);   // touch: easier to hit
     const ImVec2 tsz = f->CalcTextSizeA(ts, FLT_MAX, 0, "EPG");
-    const float padX = ts * 0.55f, h = ts * 1.45f, lineH = ImGui::GetTextLineHeight();
+    const float padX = ts * (kTouch ? 0.9f : 0.55f), h = ts * (kTouch ? 1.8f : 1.45f), lineH = ImGui::GetTextLineHeight();
     ImVec2 p = ImGui::GetCursorScreenPos();
     p.y += (lineH - h) * 0.5f;
     ImGui::SetCursorScreenPos(p);
@@ -759,7 +871,7 @@ static bool epgButton()
     const ImVec2 q(p.x + tsz.x + padX * 2, p.y + h);
     dl->AddRectFilled(p, q, ImGui::GetColorU32(ImVec4(kAccent.x, kAccent.y, kAccent.z, hov ? 1.0f : 0.8f)), h * 0.3f);
     dl->AddText(f, ts, ImVec2(p.x + padX, p.y + (h - tsz.y) * 0.5f), IM_COL32_WHITE, "EPG");
-    if (hov) ImGui::SetTooltip("Programme guide");
+    if (itemTip()) ImGui::SetTooltip("Programme guide");
     return pressed;
 }
 
@@ -778,7 +890,7 @@ static void drawSpiProgress(App &a)
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextUnformatted(txt);
     ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
+    if (itemTip())
         ImGui::SetTooltip("Service and Programme Information: station logos and programme guide.\nFiles are saved to\n%s",
                           a.snap.spiFolder.empty() ? "(waiting for the ensemble ID)" : a.snap.spiFolder.c_str());
     if (a.snap.epg && !a.snap.epg->empty()) {
@@ -838,7 +950,8 @@ static void drawServices(App &a, float width)
         ImGui::GetWindowDrawList()->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)flag->tex), fp,
                                                     ImVec2(fp.x + flagW, fp.y + flagH), ImVec2(0, 0), ImVec2(1, 1),
                                                     IM_COL32_WHITE, 2.0f * ImGui::GetStyle().FontScaleDpi);
-        if (ImGui::IsMouseHoveringRect(fp, ImVec2(fp.x + flagW, fp.y + flagH)))
+        const ImVec2 fq(fp.x + flagW, fp.y + flagH);
+        if (wantTip(fp, fq, ImGui::IsMouseHoveringRect(fp, fq)))
             ImGui::SetTooltip("%s\nECC %02X, country id %X", country->name, s.ecc, s.eid >> 12);
     }
     // ensemble information button, below the flag
@@ -891,6 +1004,7 @@ static void drawServices(App &a, float width)
         }
         if (!sel) handCursor();
         const bool hov = ImGui::IsItemHovered();
+        const bool tip = itemTip();   // touch: a long press shows the details instead of playing
         // resumed service: keep it in view while labels arrive and re-sort the list
         const int index = (int)(&e - s.services.data());
         if (sel && a.scrollToSelected && index != a.selectedIndex) {
@@ -945,7 +1059,7 @@ static void drawServices(App &a, float width)
             drawPlayingBars(dl, ImVec2(p.x + w - padX - fs * 0.85f, p.y + (rowH - fs) * 0.5f), fs,
                             std::max(a.audio.peakLeft(), a.audio.peakRight()), s.audioOk && a.player.running(),
                             ImGui::GetColorU32(kAccent));
-        if (hov || e.sid == g_forceServiceTip) drawServiceTooltip(a, e, name);
+        if (tip || e.sid == g_forceServiceTip) drawServiceTooltip(a, e, name);
         ImGui::PopID();
     }
     ImGui::EndChild();
@@ -972,19 +1086,20 @@ static void drawVolume(App &a, float width)
     char fmt[16];
     snprintf(fmt, sizeof(fmt), "Vol %d%%%%", pct);   // fmt is itself a format string
     if (ImGui::SliderFloat("##vol", &a.volume, 0.0f, 1.0f, fmt) && !a.muted) a.audio.setVolume(a.volume);
+    g_sliderActive = ImGui::IsItemActive();   // touch: dragging moves the slider, not the panel
     if (ImGui::IsItemDeactivatedAfterEdit()) saveSettings(a);
 }
 
 
-// Record pill geometry: compact, sized to sit on a line of text; the label
-// is small bold capitals
+// Record pill geometry: compact, sized to sit on a line of text (taller on a
+// touch screen); the label is small bold capitals
 struct PillMetrics {
     float h, icon, padX, gap, textSize;
     ImFont *font;
     PillMetrics()
     {
         const float fs = ImGui::GetFontSize();
-        h = fs * 1.3f;
+        h = fs * (kTouch ? 1.9f : 1.3f);
         icon = fs * 0.5f;
         padX = fs * 0.45f;
         gap = fs * 0.3f;
@@ -1051,7 +1166,7 @@ static bool recordPill(const char *id, const char *label, const Recorder::State 
     dl->AddText(m.font, m.textSize, tp, tc, txt);
     if (!g_boldFont) dl->AddText(m.font, m.textSize, ImVec2(tp.x + 0.7f, tp.y), tc, txt);   // poor man's bold
     ImGui::EndDisabled();
-    if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tip);
+    if (tip && itemTip(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tip);
     return pressed;
 }
 
@@ -1180,7 +1295,7 @@ static void drawAnnouncementPill(const ServiceEntry &e)
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), label.c_str());
     }
     ImGui::Dummy(ImVec2(q.x - p.x, ImGui::GetTextLineHeight() * 0.85f));
-    if (ImGui::IsItemHovered()) {
+    if (itemTip()) {
         if (on)
             ImGui::SetTooltip("%s announcement in progress (sub-channel %d)\nSupported: %s",
                               announcementList(e.announcing, false).c_str(), e.announceSubch,
@@ -1197,11 +1312,11 @@ static void drawNowPlaying(App &a)
     const PlayerSnapshot &s = a.snap;
     const ServiceEntry *svc = findService(a, s.selectedSid);
     const float scale = ImGui::GetStyle().FontScaleDpi;
-    const float volW = 150 * scale;
+    const float volW = a.narrow ? 0 : 150 * scale;
 
-    // header: station + format, volume on the right
+    // header: station + format, volume on the right (phone layout: below)
     ImGui::BeginGroup();
-    const float textW = ImGui::GetContentRegionAvail().x - volW - ImGui::GetStyle().ItemSpacing.x * 2;
+    const float textW = ImGui::GetContentRegionAvail().x - (a.narrow ? 0 : volW + ImGui::GetStyle().ItemSpacing.x * 2);
     // three tightly spaced lines: name, "SId D3A3 · Pop Music", codec + record pills
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f * scale));
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.45f);
@@ -1250,7 +1365,7 @@ static void drawNowPlaying(App &a)
         ImGui::TextUnformatted(rate.c_str());
         rateMin = ImGui::GetItemRectMin();
         rateMax = ImGui::GetItemRectMax();
-        rateHovered = ImGui::IsItemHovered();
+        rateHovered = itemTip();
     }
     if (!tail.empty()) {
         ImGui::SameLine(0, 0);
@@ -1263,11 +1378,16 @@ static void drawNowPlaying(App &a)
     drawRecorder(a, svc);
     ImGui::PopStyleVar();
     ImGui::EndGroup();
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - volW);
-    ImGui::BeginGroup();
-    ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * 0.4f));
-    drawVolume(a, volW);
-    ImGui::EndGroup();
+    if (a.narrow) {
+        ImGui::Spacing();
+        drawVolume(a, ImGui::GetContentRegionAvail().x);
+    } else {
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - volW);
+        ImGui::BeginGroup();
+        ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * 0.4f));
+        drawVolume(a, volW);
+        ImGui::EndGroup();
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1298,20 +1418,26 @@ static void drawNowPlaying(App &a)
                     ImGui::GetColorU32(ImGuiCol_TextDisabled), t);
     }
     ImGui::InvisibleButton("slide", box, ImGuiButtonFlags_MouseButtonRight);
-    const bool showTip = ImGui::IsItemHovered() && !ImGui::IsPopupOpen("slidemenu");
-    if (showTip && haveLogo)
-        ImGui::SetTooltip("Station logo (SPI)\nShown until the station sends a slideshow image\nRight-click to copy");
-    if (showTip && haveSlide) {
+    // what it is: a tooltip, or on a touch screen at the top of the long-press menu
+    std::string info;
+    if (haveLogo) {
+        info = "Station logo (SPI)\nShown until the station sends a slideshow image";
+    } else if (haveSlide) {
         const Slide &sl = *s.slide;
-        std::string tip = sl.name.empty() ? "Slide" : sl.name;
-        tip += "\n" + std::to_string(a.slide.w) + " x " + std::to_string(a.slide.h) + "  " + sl.ext + ", " +
-               std::to_string(sl.data.size() / 1024) + " kB";
-        if (!sl.categoryTitle.empty()) tip += "\nCategory: " + sl.categoryTitle;
-        if (!sl.clickUrl.empty()) tip += "\n" + sl.clickUrl;
-        tip += "\nRight-click to copy";
-        ImGui::SetTooltip("%s", tip.c_str());
+        info = sl.name.empty() ? "Slide" : sl.name;
+        info += "\n" + std::to_string(a.slide.w) + " x " + std::to_string(a.slide.h) + "  " + sl.ext + ", " +
+                std::to_string(sl.data.size() / 1024) + " kB";
+        if (!sl.categoryTitle.empty()) info += "\nCategory: " + sl.categoryTitle;
+        if (!sl.clickUrl.empty()) info += "\n" + sl.clickUrl;
     }
-    if ((haveSlide || haveLogo) && ImGui::BeginPopupContextItem("slidemenu")) {
+    if (!kTouch && !info.empty() && ImGui::IsItemHovered() && !ImGui::IsPopupOpen("slidemenu"))
+        ImGui::SetTooltip("%s\nRight-click to copy", info.c_str());
+    if (!info.empty() && longPressed()) ImGui::OpenPopup("slidemenu");
+    if (!info.empty() && (kTouch ? ImGui::BeginPopup("slidemenu") : ImGui::BeginPopupContextItem("slidemenu"))) {
+        if (kTouch) {
+            ImGui::TextDisabled("%s", info.c_str());
+            ImGui::Separator();
+        }
         if (ImGui::MenuItem("Copy image")) copyShownImage(a);
         handCursor();
         ImGui::EndPopup();
@@ -1547,7 +1673,11 @@ static void panelTitle(const char *title, const char *sub)
     if (g_boldFont) ImGui::PushFont(g_boldFont, 0.0f);
     ImGui::TextUnformatted(title);
     if (g_boldFont) ImGui::PopFont();
-    if (sub) {
+    if (sub && g_narrow) {   // below, wrapped
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", sub);
+        ImGui::PopStyleColor();
+    } else if (sub) {
         ImGui::SameLine(0, ImGui::GetFontSize() * 0.6f);
         ImGui::TextDisabled("%s", sub);
     }
@@ -1583,7 +1713,7 @@ static void drawCapacity(const MuxInfo &m)
     const float rightX = tp.x + ImGui::GetContentRegionAvail().x;
     const float titleH = usedSz.y;
     ImGui::SetCursorScreenPos(ImVec2(tp.x, tp.y + (titleH - fs) * 0.5f));
-    panelTitle("Capacity units", "sub-channels by start address (FIG 0/1)");
+    panelTitle("Capacity units", g_narrow ? nullptr : "sub-channels by start address (FIG 0/1)");
     const ImU32 green = col(0.25f, 0.82f, 0.58f);
     dl->AddText(bf, bigPx, ImVec2(rightX - totalSz.x - usedSz.x, tp.y), green, usedTxt);
     dl->AddText(ImVec2(rightX - totalSz.x, tp.y + bigAscent - smallAscent), ImGui::GetColorU32(ImGuiCol_TextDisabled),
@@ -1633,18 +1763,23 @@ static void drawCapacity(const MuxInfo &m)
     }
     ImGui::PopFont();
 
-    // one row per sub-channel, in the same order and colours
+    // one row per sub-channel, in the same order and colours (phone layout: the main columns)
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.9f);
     const ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
-    if (!uses.empty() && ImGui::BeginTable("subch", 9, tf)) {
+    if (!uses.empty() && ImGui::BeginTable("subch", g_narrow ? 4 : 9, tf)) {
         ImGui::TableSetupColumn("SubCh");
-        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed);
-        ImGui::TableSetupColumn("End");
-        ImGui::TableSetupColumn("CUs");
-        ImGui::TableSetupColumn("Share");
-        ImGui::TableSetupColumn("Protection");
-        ImGui::TableSetupColumn("Bit rate");
-        ImGui::TableSetupColumn("Type");
+        if (g_narrow) {
+            ImGui::TableSetupColumn("CUs");
+            ImGui::TableSetupColumn("Bit rate");
+        } else {
+            ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("End");
+            ImGui::TableSetupColumn("CUs");
+            ImGui::TableSetupColumn("Share");
+            ImGui::TableSetupColumn("Protection");
+            ImGui::TableSetupColumn("Bit rate");
+            ImGui::TableSetupColumn("Type");
+        }
         ImGui::TableSetupColumn("Service", ImGuiTableColumnFlags_WidthStretch);
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TableHeadersRow();
@@ -1664,22 +1799,31 @@ static void drawCapacity(const MuxInfo &m)
             ImGui::SameLine(0, 0);
             ImGui::SetCursorScreenPos(ImVec2(cp.x + sw + fs * 0.4f, cp.y));
             ImGui::Text("%d", u.id);
+            if (g_narrow) {
+                ImGui::TableNextColumn();
+                ImGui::Text("%d-%d", u.sc.start, u.sc.start + u.sc.size - 1);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d kbit/s", u.sc.kbps);
+            } else {
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", u.sc.start);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", u.sc.start + u.sc.size - 1);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", u.sc.size);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.1f %%", 100.0 * u.sc.size / kTotalCus);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(protectionText(u.sc).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%d kbit/s", u.sc.kbps);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(u.kind.empty() ? "-" : u.kind.c_str());
+            }
             ImGui::TableNextColumn();
-            ImGui::Text("%d", u.sc.start);
-            ImGui::TableNextColumn();
-            ImGui::Text("%d", u.sc.start + u.sc.size - 1);
-            ImGui::TableNextColumn();
-            ImGui::Text("%d", u.sc.size);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.1f %%", 100.0 * u.sc.size / kTotalCus);
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(protectionText(u.sc).c_str());
-            ImGui::TableNextColumn();
-            ImGui::Text("%d kbit/s", u.sc.kbps);
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(u.kind.empty() ? "-" : u.kind.c_str());
-            ImGui::TableNextColumn();
+            ImGui::PushTextWrapPos(0);
             ImGui::TextUnformatted(u.users.empty() ? "(not used by a service)" : joined(u.users).c_str());
+            ImGui::PopTextWrapPos();
         }
         ImGui::EndTable();
     }
@@ -1702,18 +1846,21 @@ static void drawCapacity(const MuxInfo &m)
     hovered = hoverNow;
 }
 
-// Key / value pairs, two per row
+// Key / value pairs, two per row (phone layout: one)
 static void drawPairs(const char *id, const std::vector<std::pair<std::string, std::string>> &items)
 {
-    if (!ImGui::BeginTable(id, 4, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_PadOuterX)) return;
+    const size_t perRow = g_narrow ? 1 : 2;
+    if (!ImGui::BeginTable(id, (int)perRow * 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_PadOuterX)) return;
     // the same key width everywhere, so all the tables line up
     const float kw = ImGui::CalcTextSize("Announcement clusters").x;
     ImGui::TableSetupColumn("k1", ImGuiTableColumnFlags_WidthFixed, kw);
     ImGui::TableSetupColumn("v1", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("k2", ImGuiTableColumnFlags_WidthFixed, kw);
-    ImGui::TableSetupColumn("v2", ImGuiTableColumnFlags_WidthStretch);
+    if (perRow == 2) {
+        ImGui::TableSetupColumn("k2", ImGuiTableColumnFlags_WidthFixed, kw);
+        ImGui::TableSetupColumn("v2", ImGuiTableColumnFlags_WidthStretch);
+    }
     for (size_t i = 0; i < items.size(); i++) {
-        if (i % 2 == 0) ImGui::TableNextRow();
+        if (i % perRow == 0) ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::TextDisabled("%s", items[i].first.c_str());
         ImGui::TableNextColumn();
@@ -1953,7 +2100,7 @@ static void drawServiceDetails(App &a, const MuxInfo &m)
             ImGui::SameLine(0, fs * 0.4f);
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetTextLineHeight() - flagH) * 0.5f);
             ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)flag->tex), ImVec2(flagW, flagH));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", country->name);
+            if (itemTip()) ImGui::SetTooltip("%s", country->name);
         }
 
         ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.9f);
@@ -2139,14 +2286,22 @@ static void epgPopup(App &a)
         scrollToNow = true;
     }
     handCursor();
-    ImGui::SameLine(0, ImGui::GetFontSize());
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("Times are local. Shift + mouse wheel scrolls through the day; click a station to play it.");
+    const char *hint = kTouch ? "Times are local. Drag to scroll; tap a station to play it, or hold a programme for more."
+                              : "Times are local. Shift + mouse wheel scrolls through the day; click a station to play it.";
+    if (g_narrow) {   // phone layout: on its own line
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", hint);
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::SameLine(0, ImGui::GetFontSize());
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", hint);
+    }
 
     // the grid
     const float fs = ImGui::GetFontSize();
     const float scale = ImGui::GetStyle().FontScaleDpi;
-    const float nameW = 200 * scale, pph = 230 * scale;   // name column, pixels per hour
+    const float nameW = (g_narrow ? 130 : 200) * scale, pph = 230 * scale;   // name column, pixels per hour
     const float headerH = fs * 1.6f, rowH = fs * 3.0f;
     const float dayW = (float)(dayEnd - day) / 3600.0f * pph;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 0.02f));
@@ -2192,7 +2347,7 @@ static void epgPopup(App &a)
             ImVec4 fill = onAir ? ImVec4(kAccent.x, kAccent.y, kAccent.z, 0.30f) : ImVec4(1, 1, 1, 0.06f);
             if (hov) fill.w += 0.08f;
             dl->AddRectFilled(b0, b1, ImGui::GetColorU32(fill), 4 * scale);
-            if (hov) {
+            if (wantTip(b0, b1, hov)) {
                 tip = &p;
                 tipSid = rows[r];
             }
@@ -2252,7 +2407,8 @@ static void epgPopup(App &a)
             dl->AddRectFilled(r0, r1, ImGui::GetColorU32(ImGuiCol_HeaderHovered), 6 * scale);
         if (hov) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && e->sid != a.snap.selectedSid) playService(a, e->sid);
+            const bool click = kTouch ? tapped(r0, r1) : ImGui::IsMouseClicked(ImGuiMouseButton_Left);   // touch: not when dragging
+            if (click && e->sid != a.snap.selectedSid) playService(a, e->sid);
         }
         const ImVec2 lp(wp.x + fs * 0.4f, y + (rowH - logoSz) * 0.5f);
         const LogoTextures *lt = findLogos(a, sid);
@@ -2276,7 +2432,7 @@ static void epgPopup(App &a)
     if (tip) {
         const int64_t end = tip->start + tip->duration;
         ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(fs * 28);
+        ImGui::PushTextWrapPos(std::min(fs * 28, g_areaSize.x * 0.85f));
         if (g_boldFont) ImGui::PushFont(g_boldFont, 0.0f);
         ImGui::TextUnformatted(programmeTitle(*tip));
         if (g_boldFont) ImGui::PopFont();
@@ -2502,6 +2658,15 @@ static void applyTheme(float scale)
     c[ImGuiCol_TitleBgActive] = ImVec4(0.133f, 0.145f, 0.173f, 1.0f);
     c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.133f, 0.145f, 0.173f, 1.0f);
     c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    if (kTouch) {
+        // fingers: larger controls, and hit areas larger than drawn; scrollbars only
+        // show the position (dragging the content scrolls)
+        s.FramePadding = ImVec2(12, 10);
+        s.ItemSpacing = ImVec2(10, 10);
+        s.TouchExtraPadding = ImVec2(4, 4);
+        s.ScrollbarSize = 6;
+        s.GrabMinSize = 20;
+    }
     s.ScaleAllSizes(scale);
     s.FontScaleDpi = scale;
 }
@@ -2545,6 +2710,7 @@ void appInit(App &a, const std::string &settingsPath, const std::string &spiDir,
 void appSetupUi(float scale, ImFont *boldFont)
 {
     ImGui::GetIO().IniFilename = nullptr;
+    if (kTouch) ImGui::GetIO().MouseDragThreshold = 8 * scale;   // a finger wobbles more than a mouse
     applyTheme(scale);
     g_boldFont = boldFont;
     ImGui::GetStyle().FontSizeBase = 16.0f;
@@ -2586,7 +2752,8 @@ void appDraw(App &a, ImVec2 pos, ImVec2 size)
     const float scale = ImGui::GetStyle().FontScaleDpi;
     g_areaPos = pos;
     g_areaSize = size;
-    a.narrow = size.x < 720 * scale;   // the desktop window's minimum width
+    a.narrow = g_narrow = size.x < 720 * scale;   // the desktop window's minimum width
+    touchUpdate();
 
     ImGui::SetNextWindowPos(pos);
     ImGui::SetNextWindowSize(size);
@@ -2631,7 +2798,8 @@ void appAfterRender(App &, int fbWidth, int fbHeight)
 
 double appFrameInterval(const App &a)
 {
-    // ~20 fps while playing (level meter, label updates), slower when idle
+    // ~20 fps while playing (level meter, label updates), slower when idle; smooth while a fling scrolls
+    if (g_flingVel.x != 0 || g_flingVel.y != 0) return 1.0 / 60;
     return a.player.running() ? 0.05 : 0.25;
 }
 
