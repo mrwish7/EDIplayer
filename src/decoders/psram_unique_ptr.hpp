@@ -738,14 +738,14 @@ class ps_ptr {
     // ps_ptr<char>s; s = "abc"; s.push_back('1); -> abc1
 
     void push_back(char c) {
-        if (length + 1 >= capacity()) {
+        if (length_ + 1 >= capacity()) {
             // Wenn zu klein, Kapazität verdoppeln (wie std::string)
             size_t new_cap = (capacity() == 0) ? 16 : capacity() * 2;
             reserve(new_cap);
         }
 
-        mem.get()[length++] = c;
-        mem.get()[length] = '\0';
+        mem.get()[length_++] = c;
+        mem.get()[length_] = '\0';
     }
     // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
     // 📌📌📌  A S S I G N _ V E C T O R  📌📌📌
