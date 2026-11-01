@@ -99,7 +99,7 @@ EDI (UDP/TCP) ─► PFT reassembly ─► AF / TAG parsing (deti, est)
                                       │ FIC              │ MST of the selected sub-channel
                                       ▼                  ▼
                            service list (FIG 0/2,   DAB+: superframe sync ─► AUs ─► libfaad (AAC 960, SBR, PS)
-                           1/0, 1/1)                DAB:  MP2 frames ─────────────► libmad
+                           1/0, 1/1)                DAB:  MP2 frames (48/24 kHz) ─► libmad
                                                          │ PAD                       │ PCM
                                                          ▼                           ▼
                                              DLS + DL Plus, MOT slides   jitter buffer ─► miniaudio
@@ -116,7 +116,8 @@ EDI (UDP/TCP) ─► PFT reassembly ─► AF / TAG parsing (deti, est)
 
 Changes to the reused code:
 
-- `audio.c` also hands each AAC access unit (or MP2 frame) to the decoder, not just its PAD.
+- `audio.c` also hands each AAC access unit (or MP2 frame) to the decoder, not just its PAD. It also handles 24 kHz (MPEG-2 LSF) MP2, whose frames span two logical frames.
+- The libmad port is built with its full-precision 64-bit multiply (`FPM_64BIT`, `OPT_ACCURACY`) instead of the ESP32-oriented speed options, whose 32-bit multiply lost precision and overflowed on loud passages. Its output now matches mpg123 to within float precision.
 - `fic.c` records each service's primary component type (DAB/DAB+), keeps labels up to date, and trims label spaces.
 - The libfaad port's long IMDCT didn't accept the 1920-point transform used by the 960-sample frames of DAB+; `imdct_long()` now maps it onto its table slot, as `mdct_init()` already did.
 
@@ -141,9 +142,8 @@ From there:
 
 ## Limitations
 
-- **PFT with Reed-Solomon FEC**: all fragments must arrive; FEC isn't used to recover lost ones.
+- **PFT with Reed-Solomon FEC**: such packets are reassembled (de-interleaved, parity removed), but all fragments must arrive; FEC isn't used to correct errors or recover lost fragments.
 - **DAB+ Reed-Solomon** isn't applied (EDI is normally error-free). AUs failing their CRC are replaced by silence.
-- **MP2 at 24 kHz** (half sample rate) isn't detected, only 48 kHz.
 - **Slideshow in MOT directory mode** and packet-mode data services aren't supported. Only audio services are listed.
 - **SPI:** the programme guide shows programmes, not programme groups or the parts of a programme (programme events). The SI file is saved in its binary broadcast form, not as XML. gzip-compressed SI objects and compressed MOT directories aren't decoded. SPI carried in a service's X-PAD isn't decoded, only packet-mode SPI.
 - Some stations rotate their service label. The list shows the latest label but keeps the position of the first one seen, so rows don't jump.

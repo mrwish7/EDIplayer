@@ -12,8 +12,9 @@
  * fragment per packet. This requires holding PFT_WINDOW collectors open at
  * the same time.
  *
- * Reed-Solomon error correction is not implemented; all Fcount fragments must
- * arrive for a packet to be reassembled.
+ * Packets sent with Reed-Solomon FEC (FEC=1) are de-interleaved and the
+ * parity removed, but correction is not applied: as without FEC, all Fcount
+ * fragments must arrive for a packet to be reassembled.
  */
 
 #define PFT_WINDOW          8    /* concurrent Pseq collectors */
@@ -32,6 +33,8 @@ typedef struct {
     uint16_t   Pseq;
     uint16_t   Fcount;
     uint32_t   n_received;
+    bool       fec;                  /* RS protected: RSk data bytes per chunk, RSz padding */
+    uint8_t    RSk, RSz;
     pft_frag_t frags[PFT_MAX_FRAGMENTS];
 } pft_slot_t;
 

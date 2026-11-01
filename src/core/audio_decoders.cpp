@@ -151,6 +151,6 @@ bool Mp2FrameDecoder::decode(const uint8_t *frame, size_t len, std::vector<float
 std::string Mp2FrameDecoder::describe() const
 {
     if (!rate_) return "";
-    return "MPEG-1 Layer II, " + std::to_string(rate_ / 1000) + " kHz, " +
+    return std::string(rate_ < 32000 ? "MPEG-2" : "MPEG-1") + " Layer II, " + std::to_string(rate_ / 1000) + " kHz, " +
            (channels_ == 2 ? "stereo" : "mono");
 }

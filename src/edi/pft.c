@@ -118,6 +118,11 @@ int pft_push_fragment(pft_ctx_t *ctx, const uint8_t *pkt, size_t len)
     }
 
     if (!slot->frags[Findex].received) {
+        if (slot->n_received == 0) {
+            slot->fec = fec;
+            slot->RSk = fec ? pkt[12] : 0;
+            slot->RSz = fec ? pkt[13] : 0;
+        }
         slot->frags[Findex].Plen = Plen;
         memcpy(slot->frags[Findex].data, pkt + hdr_len, Plen);
         slot->frags[Findex].received = true;
@@ -130,6 +135,38 @@ int pft_push_fragment(pft_ctx_t *ctx, const uint8_t *pkt, size_t len)
     return any_complete(ctx) ? 1 : 0;
 }
 
+/*
+ * FEC packets (TS 102 821 §7.3): the AF packet, zero padded by RSz bytes, is
+ * split into c chunks of RSk bytes, each followed by 48 RS parity bytes. This
+ * RS block is spread over the fragments byte by byte: block byte n is byte
+ * n / Fcount of fragment n % Fcount.
+ */
+#define PFT_RS_PARITY 48
+
+static size_t rs_reassemble(const pft_slot_t *s, uint8_t *buf, size_t buflen)
+{
+    const size_t F = s->Fcount, k = s->RSk, chunk = k + PFT_RS_PARITY;
+    if (k == 0) return 0;
+    size_t total = 0;
+    for (size_t i = 0; i < F; i++) total += s->frags[i].Plen;
+    const size_t c = total / chunk;
+    if (c == 0 || c * k <= s->RSz || c * k - s->RSz > buflen) {
+        edi_log("PFT: bad FEC parameters for Pseq %u (k %zu, z %u, %zu bytes)\n", s->Pseq, k, s->RSz, total);
+        return 0;
+    }
+    const size_t len = c * k - s->RSz;
+    for (size_t o = 0; o < len; o++) {
+        const size_t n = (o / k) * chunk + o % k;
+        const pft_frag_t *f = &s->frags[n % F];
+        if (n / F >= f->Plen) {
+            edi_log("PFT: short FEC fragment in Pseq %u\n", s->Pseq);
+            return 0;
+        }
+        buf[o] = f->data[n / F];
+    }
+    return len;
+}
+
 size_t pft_get_af_packet(pft_ctx_t *ctx, uint8_t *buf, size_t buflen)
 {
     /* Return the oldest complete slot to preserve frame order. */
@@ -140,6 +177,12 @@ size_t pft_get_af_packet(pft_ctx_t *ctx, uint8_t *buf, size_t buflen)
             oldest = &ctx->slots[i];
     }
     if (!oldest) return 0;
+
+    if (oldest->fec) {
+        size_t n = rs_reassemble(oldest, buf, buflen);
+        oldest->active = false;
+        return n;
+    }
 
     size_t offset = 0;
     for (uint16_t i = 0; i < oldest->Fcount; i++) {

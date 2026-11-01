@@ -17,9 +17,10 @@
  *   Reed-Solomon correction is not applied — over EDI the payload is
  *   normally error-free, and each AU is still CRC-checked before use.
  *
- * DAB (MPEG-1 Layer II, 48 kHz, ETSI EN 300 401 §7.4):
- *   One audio frame per 24 ms logical frame. PAD sits at the end of the
- *   frame: [X-PAD (reversed)] [ScF-CRC] [F-PAD (2 bytes)].
+ * DAB (MPEG Layer II, ETSI EN 300 401 §7.4):
+ *   At 48 kHz (MPEG-1) one audio frame per 24 ms logical frame; at 24 kHz
+ *   (MPEG-2 LSF) one per two logical frames (48 ms). PAD sits at the end of
+ *   each audio frame: [X-PAD (reversed)] [ScF-CRC] [F-PAD (2 bytes)].
  *
  * In both cases, the PAD callback receives the X-PAD bytes in transmitted
  * (reversed) order plus the 2-byte F-PAD.
@@ -28,7 +29,7 @@
  *   DAB+: one AAC access unit (CRC removed) per call, plus the superframe
  *         format byte; data is NULL when the AU failed its CRC, so the
  *         decoder can keep timing by inserting silence.
- *   MP2:  one complete MPEG audio frame (the whole logical frame).
+ *   MP2:  one complete MPEG audio frame (one logical frame, or two at 24 kHz).
  */
 
 /* Returns the number of X-PAD bytes actually in use (CI list + subfields) */
@@ -61,7 +62,9 @@ typedef struct {
     int         n_frames;             /* frames currently buffered (0..5) */
     audio_fmt_t fmt;
     bool        synced;               /* DAB+ superframe sync held */
-    int         mp2_hits;             /* consecutive frames with MP2 header */
+    int         mp2_hits;             /* consecutive MP2 frames found */
+    uint8_t     mp2_half[MAX_MST_LEN];/* first half of a 24 kHz MP2 frame */
+    size_t      mp2_half_len;         /* 0: none pending */
 
     pad_cb_t    cb;
     void       *opaque;

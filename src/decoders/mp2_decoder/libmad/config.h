@@ -73,14 +73,16 @@
 /* Define to disable debugging assertions. */
 /* #undef NDEBUG */
 
-/* Define to optimize for accuracy over speed. */
-/* #undef OPT_ACCURACY */
+/* Define to optimize for accuracy over speed. EDIplayer: desktop CPUs have
+   cycles to spare, and the speed options (with the 32-bit FPM_DEFAULT
+   multiply) lose precision and overflow on loud passages. */
+#define OPT_ACCURACY 1
 
 /* Define to optimize for speed over accuracy. */
-#define OPT_SPEED 1
+/* #undef OPT_SPEED */
 
 /* Define to enable a fast subband synthesis approximation optimization. */
-#define OPT_SSO 1
+/* #undef OPT_SSO */
 
 /* Define to influence a strict interpretation of the ISO/IEC standards, even
    if this is in opposition with best accepted practices. */
@@ -135,13 +137,8 @@
 /* Define to `int' if <sys/types.h> does not define. */
 /* #undef pid_t */
 
-#if defined(__arm__)	&& !defined(ARDUINO)
-# define FPM_ARM
-#elif defined(_X64_)
-# define FPM_INTEL
-#else
-#define FPM_DEFAULT
-#endif
+/* EDIplayer: portable 64-bit fixed-point multiply (full precision) */
+#define FPM_64BIT
 
 /// Move major data from the stack to the heap
 #define MAD_STACK_HACK 1

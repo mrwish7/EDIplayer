@@ -22,6 +22,7 @@ void audio_set_data_cb(audio_ctx_t *ctx, audio_data_cb_t cb, void *opaque)
 void audio_reset(audio_ctx_t *ctx)
 {
     ctx->n_frames = 0;
+    ctx->mp2_half_len = 0;
 }
 
 const char *audio_fmt_name(audio_fmt_t fmt)
@@ -202,17 +203,24 @@ static void feed_dabplus(audio_ctx_t *ctx, const uint8_t *mst, size_t len)
 static const uint16_t mp2_bitrates[16] = {
     0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0
 };
+static const uint16_t mp2_lsf_bitrates[16] = {   /* MPEG-2 LSF, Layer II */
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0
+};
 
-/* MPEG-1 Layer II, 48 kHz header check. 24 kHz (LSF) frames span two
- * logical frames and are not handled. */
-static bool mp2_header_ok(const uint8_t *f, size_t len)
+static bool mp2_lsf(const uint8_t *f) { return !(f[1] & 0x08); }
+
+/* Layer II header check: the number of logical frames the audio frame
+ * starting at f spans (1 at 48 kHz, 2 at 24 kHz), or 0 if it isn't one. */
+static int mp2_header(const uint8_t *f, size_t len)
 {
-    if (len < 8) return false;
-    if (f[0] != 0xFF || (f[1] & 0xFE) != 0xFC) return false;
+    if (len < 8) return 0;
+    if (f[0] != 0xFF || (f[1] & 0xF6) != 0xF4) return 0;   /* sync, Layer II */
     uint8_t br_idx = f[2] >> 4;
-    if (br_idx == 0 || br_idx == 15) return false;
-    if (((f[2] >> 2) & 0x03) != 1) return false;  /* 48 kHz */
-    return true;
+    if (br_idx == 0 || br_idx == 15) return 0;
+    if (((f[2] >> 2) & 0x03) != 1) return 0;  /* 48 kHz, or 24 kHz for LSF */
+    if (!mp2_lsf(f)) return 1;
+    /* 144 * bitrate / 24 kHz bytes: must fill exactly two logical frames */
+    return (size_t)mp2_lsf_bitrates[br_idx] * 6 == 2 * len ? 2 : 0;
 }
 
 static void feed_mp2(audio_ctx_t *ctx, const uint8_t *f, size_t len)
@@ -220,11 +228,13 @@ static void feed_mp2(audio_ctx_t *ctx, const uint8_t *f, size_t len)
     if (ctx->data_cb)
         ctx->data_cb(ctx->data_opaque, AUDIO_MP2, 0, f, len);
 
-    uint16_t bitrate = mp2_bitrates[f[2] >> 4];
-    bool     mono    = (f[3] >> 6) == 3;
+    const bool lsf     = mp2_lsf(f);
+    uint16_t   bitrate = (lsf ? mp2_lsf_bitrates : mp2_bitrates)[f[2] >> 4];
+    bool       mono    = (f[3] >> 6) == 3;
 
-    /* ScF-CRC is 2 bytes at low bitrates, otherwise 4 (as dablin) */
-    size_t scf_crc_len = bitrate < (mono ? 56 : 112) ? 2 : 4;
+    /* ScF-CRC is 2 bytes with the 48 kHz low bitrate allocation tables (8 or
+     * 12 sub-bands), otherwise 4; the 24 kHz table always has 30 sub-bands */
+    size_t scf_crc_len = !lsf && bitrate < (mono ? 56 : 112) ? 2 : 4;
     size_t hdr_len     = 4;
     if (len < hdr_len + scf_crc_len + FPAD_LEN)
         return;
@@ -256,24 +266,46 @@ void audio_feed(audio_ctx_t *ctx, const uint8_t *mst, size_t len)
         ctx->n_frames  = 0;
         ctx->synced    = false;
         ctx->mp2_hits  = 0;
+        ctx->mp2_half_len = 0;
         ctx->fmt       = AUDIO_UNKNOWN;
     }
 
-    /* MP2 frames start with a sync word in every logical frame; require
-     * a few in a row before committing. DAB+ superframe sync wins. */
+    /* MP2 frames start with a sync word in every logical frame (every
+     * other one at 24 kHz); require a few frames in a row before
+     * committing. DAB+ superframe sync wins. */
     if (ctx->fmt != AUDIO_DABPLUS) {
-        if (mp2_header_ok(mst, len)) {
-            if (++ctx->mp2_hits >= 3) {
-                if (ctx->fmt != AUDIO_MP2)
-                    edi_log("audio: DAB (MPEG-1 Layer II) stream detected\n");
-                ctx->fmt = AUDIO_MP2;
-                feed_mp2(ctx, mst, len);
-                return;
-            }
+        const int span = mp2_header(mst, len);
+        const uint8_t *frame = NULL;
+        size_t frame_len = 0;
+        bool ok = true;
+        if (ctx->mp2_half_len && span == 0) {   /* second half of a 24 kHz frame */
+            memcpy(ctx->mp2_half + len, mst, len);
+            frame = ctx->mp2_half;
+            frame_len = 2 * len;
+            ctx->mp2_half_len = 0;
+        } else if (span == 2 && 2 * len <= sizeof(ctx->mp2_half)) {
+            if (ctx->mp2_half_len) ctx->mp2_hits = 0;   /* a header where the second half was due */
+            memcpy(ctx->mp2_half, mst, len);
+            ctx->mp2_half_len = len;
+            if (ctx->fmt == AUDIO_MP2) return;
+        } else if (span == 1 && !ctx->mp2_half_len) {
+            frame = mst;
+            frame_len = len;
         } else {
+            ok = false;
+        }
+
+        if (!ok) {
             ctx->mp2_hits = 0;
             if (ctx->fmt == AUDIO_MP2)
                 ctx->fmt = AUDIO_UNKNOWN;
+        } else if (frame && ++ctx->mp2_hits >= 3) {
+            if (ctx->fmt != AUDIO_MP2)
+                edi_log("audio: DAB (%s Layer II) stream detected\n",
+                        mp2_lsf(frame) ? "MPEG-2, 24 kHz" : "MPEG-1, 48 kHz");
+            ctx->fmt = AUDIO_MP2;
+            feed_mp2(ctx, frame, frame_len);
+            return;
         }
     }
 
