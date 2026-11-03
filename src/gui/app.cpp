@@ -361,6 +361,21 @@ static void setNextPopupRect(float fx, float fy)
                             ImVec2(0.5f, 0.5f));
 }
 
+// Place the next popup below `anchor`, its right edge there; in the phone
+// layout across the width of the UI instead, as it wouldn't fit to the left
+static void setNextDropdownPos(ImVec2 anchor, float minWidth)
+{
+    if (g_narrow) {
+        const float m = ImGui::GetStyle().WindowPadding.x;
+        const float w = g_areaSize.x - m * 2;
+        ImGui::SetNextWindowPos(ImVec2(g_areaPos.x + m, anchor.y), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0), ImVec2(w, FLT_MAX));
+    } else {
+        ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(minWidth, 0), ImVec2(FLT_MAX, FLT_MAX));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Touch screens (Android). Nothing hovers: a long press opens an item's
 // tooltip, which stays until the next touch, and dragging scrolls the panel
@@ -634,16 +649,18 @@ static void drawFavouriteStar(App &a, float size)
     drawStar(ImGui::GetWindowDrawList(), ImVec2(p.x + size * 0.5f, p.y + size * 0.5f), size * 0.3f,
              fav ? gold : ImGui::GetColorU32(a.url[0] ? ImGuiCol_Text : ImGuiCol_TextDisabled), fav != nullptr);
 
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));   // drops down from the star
+    setNextDropdownPos(anchor, 0);   // drops down from the star
     if (!ImGui::BeginPopup("favedit")) return;
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::TextDisabled(fav ? "Favourite" : "Save as favourite");
 #ifndef __ANDROID__
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
 #endif
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
+    ImGui::SetNextItemWidth(g_narrow ? -FLT_MIN : ImGui::GetFontSize() * 18);   // phone: the popup's width
     const bool enter = textField("##label", "Favourite label", "Label", label, sizeof(label));
+    if (g_narrow) ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("%s", a.url);
+    if (g_narrow) ImGui::PopTextWrapPos();
     if (ImGui::Button(fav ? "Save" : "Add") || enter) {
         const std::string l = label[0] ? label : a.url;
         if (fav) fav->label = l;
@@ -673,8 +690,7 @@ static void drawFavouriteStar(App &a, float size)
 // The favourites dropdown: label and address on one line, x to remove on hover
 static void drawFavouritesList(App &a, ImVec2 anchor)
 {
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, ImVec2(1, 0));   // drops down from the arrow
-    ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 22, 0), ImVec2(FLT_MAX, FLT_MAX));
+    setNextDropdownPos(anchor, ImGui::GetFontSize() * 22);   // drops down from the arrow
     if (!ImGui::BeginPopup("favourites")) return;
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     if (a.favourites.empty()) {
@@ -688,7 +704,7 @@ static void drawFavouritesList(App &a, ImVec2 anchor)
         ImGui::PushID((int)i);
         const bool current = f.url == a.url;
         const ImVec2 p = ImGui::GetCursorScreenPos();
-        const float w = std::max(ImGui::GetContentRegionAvail().x, fs * 22);
+        const float w = g_narrow ? ImGui::GetContentRegionAvail().x : std::max(ImGui::GetContentRegionAvail().x, fs * 22);
         const float xw = ImGui::GetFrameHeight();   // remove button
         if (ImGui::Selectable("##fav", current, ImGuiSelectableFlags_AllowOverlap, ImVec2(w, 0))) {
             if (!current || !a.player.running()) switchSource(a, f.url);
