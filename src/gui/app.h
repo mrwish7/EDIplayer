@@ -45,6 +45,9 @@ struct App {
         int sid = -1;   // service last played from it
     };
     std::vector<Favourite> favourites;
+    // desktop window (main_glfw.cpp): size in unscaled pixels, 0 for the default, when not maximised
+    int windowW = 0, windowH = 0;
+    bool windowMaximized = false;
 
     // runtime
     AudioOut audio;

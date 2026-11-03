@@ -55,6 +55,8 @@ static void loadSettings(App &a)
         if (k == "url") snprintf(a.url, sizeof(a.url), "%s", v.c_str());
         else if (k == "volume") a.volume = std::max(0.0f, std::min(1.0f, (float)atof(v.c_str())));
         else if (k == "sid") a.lastSid = v.empty() ? -1 : (int)strtol(v.c_str(), nullptr, 16);
+        else if (k == "window") sscanf(v.c_str(), "%dx%d", &a.windowW, &a.windowH);   // <width>x<height>
+        else if (k == "maximized") a.windowMaximized = v == "1";
         else if (k == "favourite") {   // <url> TAB <label> [TAB <SId hex>]
             std::vector<std::string> parts;
             std::stringstream ss(v);
@@ -76,6 +78,8 @@ static void saveSettings(const App &a)
     char sid[16] = "";
     if (a.lastSid >= 0) snprintf(sid, sizeof(sid), "%04X", a.lastSid);
     f << "url=" << a.url << "\n" << "volume=" << a.volume << "\n" << "sid=" << sid << "\n";
+    if (a.windowW > 0 && a.windowH > 0)
+        f << "window=" << a.windowW << "x" << a.windowH << "\n" << "maximized=" << (a.windowMaximized ? 1 : 0) << "\n";
     for (const auto &fav : a.favourites) {
         char fsid[16] = "";
         if (fav.sid >= 0) snprintf(fsid, sizeof(fsid), "%04X", fav.sid);

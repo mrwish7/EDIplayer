@@ -20,6 +20,8 @@
 #include <GLFW/glfw3native.h>   // HWND for the clipboard
 #endif
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -201,9 +203,18 @@ int main(int, char **)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     const float scale = ImGui_ImplGlfw_GetContentScaleForMonitor(glfwGetPrimaryMonitor());
-    GLFWwindow *win = glfwCreateWindow((int)(940 * scale), (int)(610 * scale), "EDIplayer", nullptr, nullptr);
+    // the size it had last time, within the screen's work area (with room for
+    // the window frame, which the size doesn't include)
+    const int minW = (int)(720 * scale), minH = (int)(520 * scale);
+    int areaX, areaY, areaW, areaH;
+    glfwGetMonitorWorkarea(glfwGetPrimaryMonitor(), &areaX, &areaY, &areaW, &areaH);
+    const int maxW = std::max(minW, (int)(areaW * 0.95f)), maxH = std::max(minH, (int)(areaH * 0.95f));
+    const int w = std::clamp((int)((a.windowW > 0 ? a.windowW : 940) * scale), minW, maxW);
+    const int h = std::clamp((int)((a.windowH > 0 ? a.windowH : 610) * scale), minH, maxH);
+    glfwWindowHint(GLFW_MAXIMIZED, a.windowMaximized ? GLFW_TRUE : GLFW_FALSE);
+    GLFWwindow *win = glfwCreateWindow(w, h, "EDIplayer", nullptr, nullptr);
     if (!win) return 1;
-    glfwSetWindowSizeLimits(win, (int)(720 * scale), (int)(520 * scale), GLFW_DONT_CARE, GLFW_DONT_CARE);
+    glfwSetWindowSizeLimits(win, minW, minH, GLFW_DONT_CARE, GLFW_DONT_CARE);
 #ifndef _WIN32
     // window icon (on Windows it comes from the GLFW_ICON resource)
     {
@@ -231,6 +242,13 @@ int main(int, char **)
 
     while (!glfwWindowShouldClose(win) && !appQuitRequested()) {
         glfwWaitEventsTimeout(appFrameInterval(a));
+        // the size to save: the user's own (not while maximised or minimised)
+        if (!glfwGetWindowAttrib(win, GLFW_MAXIMIZED) && !glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {
+            int ww, wh;
+            glfwGetWindowSize(win, &ww, &wh);
+            a.windowW = (int)lroundf(ww / scale);
+            a.windowH = (int)lroundf(wh / scale);
+        }
         appUpdate(a);
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -249,7 +267,8 @@ int main(int, char **)
         glfwSwapBuffers(win);
     }
 
-    appShutdown(a);
+    a.windowMaximized = glfwGetWindowAttrib(win, GLFW_MAXIMIZED) != 0;
+    appShutdown(a);   // saves the settings, with the window size
     appReleaseGl(a);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

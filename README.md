@@ -52,7 +52,7 @@ If the multiplex carries SPI (Service and Programme Information, ETSI TS 102 818
 
 All received files are saved to `EDIplayer_SPI/<ECC><EId>/` next to the program, e.g. `EDIplayer_SPI/E1CFCB/`. On Linux, if that folder isn't writable, they go under `~/.config/ediplayer/` instead. The folder also holds `logos.txt`, which records which logo belongs to which service, so the next time you connect to that ensemble the logos appear straight away.
 
-The source, volume, last service and favourites are saved (`EDIplayer.ini` next to the exe on Windows, `~/.config/ediplayer/settings.ini` on Linux). On the next start the last service resumes automatically. **Log** shows what the receiver and decoders report.
+The source, volume, last service, favourites and window size are saved (`EDIplayer.ini` next to the exe on Windows, `~/.config/ediplayer/settings.ini` on Linux). On the next start the last service resumes automatically. **Log** shows what the receiver and decoders report.
 
 ### Android
 
